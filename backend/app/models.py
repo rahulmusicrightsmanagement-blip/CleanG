@@ -1,106 +1,128 @@
-"""ORM schema: users, the shared master records store with concurrency
-control, the change-log audit trail, and the dedup skip log.
-
-Music/custom data fields (the 29 fields + any dynamic columns) stay fully
-nullable and live in the `data` JSON document on each master record.
-The system/auth columns below are REQUIRED because login and concurrent
-cleaning cannot work with null ids, versions, or timestamps."""
 import enum
-import uuid
 from datetime import datetime
 
-from sqlalchemy import (
-    Column, String, Text, Boolean, Integer, DateTime, ForeignKey,
-    Enum as SAEnum, JSON,
-)
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
-from .db_types import GUID
 
 
-def _new_uuid():
-    return uuid.uuid4()
-
-
-# ---- enumerations ----
 class UserRole(str, enum.Enum):
     admin = "admin"
-    cleaner = "cleaner"
-    viewer = "viewer"
+    user = "user"
 
 
-class RecordStatus(str, enum.Enum):
-    raw = "raw"
-    in_progress = "in_progress"
-    cleaned = "cleaned"
-    verified = "verified"
+class FileStatus(str, enum.Enum):
+    uploaded = "uploaded"   # validated + rows extracted, mapping suggested
+    mapped = "mapped"       # mapping confirmed by the user
+    cleaned = "cleaned"     # cleaning engine has run
+    committed = "committed"  # clean rows saved to the master records
 
 
-class SourceFormat(str, enum.Enum):
-    SVF = "SVF"
-    PDL = "PDL"
+class BranchStatus(str, enum.Enum):
+    active = "active"
+    archived = "archived"
 
 
-# ---- tables ----
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(GUID, primary_key=True, default=_new_uuid)
-    name = Column(String, nullable=True)
-    email = Column(String, nullable=False, unique=True, index=True)
-    # If using an external auth/OAuth provider, store provider_user_id here.
-    password_hash = Column(String, nullable=False)
-    role = Column(SAEnum(UserRole, name="user_role"), nullable=False, default=UserRole.cleaner)
-    is_active = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    hashed_password: Mapped[str] = mapped_column(String(255))
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role"), default=UserRole.user
+    )
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
-
-class MasterRecord(Base):
-    __tablename__ = "master_records"
-
-    # Surrogate PK — ISRC is nullable and cannot be the key.
-    id = Column(GUID, primary_key=True, default=_new_uuid)
-
-    # Music data (29 fields) + custom fields — all nullable — as a JSON document.
-    data = Column(JSON, nullable=False, default=dict)
-    dedup_key = Column(String, nullable=True, index=True)
-
-    # System / concurrency columns
-    source_format = Column(SAEnum(SourceFormat, name="source_format"), nullable=True)
-    status = Column(SAEnum(RecordStatus, name="record_status"), nullable=False, default=RecordStatus.raw)
-    assigned_to = Column(GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    locked_by = Column(GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    locked_at = Column(DateTime(timezone=True), nullable=True)
-    version = Column(Integer, nullable=False, default=0)  # optimistic concurrency
-    created_by = Column(GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    updated_by = Column(GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    branches: Mapped[list["Branch"]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
     )
 
 
-class ChangeLog(Base):
-    """Audit trail: one row per field change during cleaning."""
-    __tablename__ = "change_log"
+class Branch(Base):
+    """A workspace created per cleaning request. Each new request = a new branch."""
 
-    id = Column(GUID, primary_key=True, default=_new_uuid)
-    record_id = Column(GUID, ForeignKey("master_records.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id = Column(GUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    field_name = Column(String, nullable=False)
-    old_value = Column(Text, nullable=True)
-    new_value = Column(Text, nullable=True)
-    changed_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    __tablename__ = "branches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[BranchStatus] = mapped_column(
+        Enum(BranchStatus, name="branch_status"), default=BranchStatus.active
+    )
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    owner: Mapped["User"] = relationship(back_populates="branches")
+    files: Mapped[list["UploadedFile"]] = relationship(
+        back_populates="branch", cascade="all, delete-orphan"
+    )
 
 
-class DedupEntry(Base):
-    """Candidates skipped on write because a matching master record existed."""
-    __tablename__ = "dedup_log"
+class MasterColumn(Base):
+    """The canonical output schema, seeded from the master format workbook.
 
-    id = Column(GUID, primary_key=True, default=_new_uuid)
-    triggered_by = Column(GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    singer = Column(String, default="")
-    isrc = Column(String, default="")
-    match_key = Column(String, default="")
-    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    The final cleaned sheet conforms to these columns, in this order.
+    """
+
+    __tablename__ = "master_columns"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, unique=True)
+    name: Mapped[str] = mapped_column(String(255))
+
+
+class UploadedFile(Base):
+    """An input file uploaded into a branch, plus its validation + mapping state."""
+
+    __tablename__ = "uploaded_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id"))
+    original_name: Mapped[str] = mapped_column(String(512))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    sheet_name: Mapped[str] = mapped_column(String(255))
+    header_row: Mapped[int] = mapped_column(Integer, default=1)
+    n_columns: Mapped[int] = mapped_column(Integer)
+    n_rows: Mapped[int] = mapped_column(Integer)
+    headers: Mapped[list] = mapped_column(JSON)
+    # The extracted rows themselves — we do NOT keep the original file on disk.
+    data: Mapped[list] = mapped_column(JSON, default=list)
+    # Master-centric mapping: [{master_column, position, input_header, confidence, method, needs_review}]
+    mapping: Mapped[list] = mapped_column(JSON, default=list)
+    warnings: Mapped[list] = mapped_column(JSON, default=list)
+    # Human review overlay. Cleaning is computed in memory from `data` + `mapping`;
+    # only the cells a reviewer changed are persisted here, keyed by row index:
+    #   {"<row_index>": {"<master_column>": "value", ...}}
+    corrections: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Row indexes the reviewer dropped (excluded from output and the master save).
+    dropped: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[FileStatus] = mapped_column(
+        Enum(FileStatus, name="file_status"), default=FileStatus.uploaded
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    branch: Mapped["Branch"] = relationship(back_populates="files")
+
+
+class MasterRecord(Base):
+    """A committed, fully-clean record stored in the master dataset."""
+
+    __tablename__ = "master_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id"))
+    file_id: Mapped[int] = mapped_column(ForeignKey("uploaded_files.id"))
+    data: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

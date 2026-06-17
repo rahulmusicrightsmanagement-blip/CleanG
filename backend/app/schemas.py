@@ -1,82 +1,194 @@
-"""Pydantic request/response models."""
-from typing import Any, Optional
+from datetime import datetime
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr
 
-from .models import UserRole
-
-
-# ---- auth ----
-class SignupIn(BaseModel):
-    email: str
-    password: str
-    name: Optional[str] = None
-
-    @field_validator("email")
-    @classmethod
-    def _email(cls, v: str) -> str:
-        v = v.strip().lower()
-        if "@" not in v or "." not in v.split("@")[-1]:
-            raise ValueError("Enter a valid email address")
-        return v
-
-    @field_validator("password")
-    @classmethod
-    def _password(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Password must be at least 6 characters")
-        return v
+from .models import BranchStatus, FileStatus, UserRole
 
 
-class LoginIn(BaseModel):
-    email: str
+# ---- Auth ----
+class LoginRequest(BaseModel):
+    email: EmailStr
     password: str
 
 
-class TokenOut(BaseModel):
+class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    email: str
-    role: UserRole
-    name: Optional[str] = None
+
+
+# ---- Users ----
+class UserCreate(BaseModel):
+    email: EmailStr
+    full_name: str
+    password: str
+    role: UserRole = UserRole.user
 
 
 class UserOut(BaseModel):
-    id: str
-    email: str
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr
+    full_name: str
     role: UserRole
-    name: Optional[str] = None
     is_active: bool
+    created_at: datetime
 
 
-# ---- pipeline ----
-class CleanIn(BaseModel):
-    rawRows: list[dict[str, Any]]
-    fields: list[dict[str, Any]]
-    mapping: dict[str, list[str]]
+# ---- Branches ----
+class BranchCreate(BaseModel):
+    name: str
+    description: str | None = None
 
 
-class ValidateIn(BaseModel):
-    records: list[dict[str, Any]]
+class BranchOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None
+    status: BranchStatus
+    owner_id: int
+    created_at: datetime
+    # Lightweight roll-ups so the dashboard can render rich cards without N+1
+    # requests. `progress` is the furthest workflow step any file has reached
+    # (0 none · 1 uploaded · 2 mapped · 3 cleaned · 4 committed).
+    file_count: int = 0
+    progress: int = 0
 
 
-class UploadIn(BaseModel):
-    records: list[dict[str, Any]]
-    source_format: Optional[str] = None  # 'SVF' | 'PDL'
+# ---- Master schema ----
+class MasterColumnOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    position: int
+    name: str
 
 
-class ApproveIn(BaseModel):
-    record: dict[str, Any]
+# ---- Mapping / uploaded files ----
+class MappingItem(BaseModel):
+    master_column: str
+    position: int
+    input_header: str | None
+    confidence: float
+    method: str  # exact | synonym | fuzzy | unmatched | manual
+    needs_review: bool
 
 
-class ExtractIn(BaseModel):
-    preset: str
-    extra: list[str] = []
-    fields: list[dict[str, Any]]
+class FileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    branch_id: int
+    original_name: str
+    size_bytes: int
+    sheet_name: str
+    n_columns: int
+    n_rows: int
+    headers: list[str]
+    mapping: list[MappingItem]
+    warnings: list[str]
+    status: FileStatus
+    created_at: datetime
 
 
-# ---- concurrency ----
-class SaveIn(BaseModel):
-    version: int                       # version the client loaded (optimistic check)
-    changes: dict[str, Any]            # field_name -> new value
-    status: Optional[str] = None       # optional new status
+class WorkspaceOut(BaseModel):
+    """Everything the branch workspace needs in one request: the branch plus its
+    current file (or null). The file's big row blob is never included."""
+
+    branch: BranchOut
+    file: FileOut | None = None
+
+
+class MappingUpdate(BaseModel):
+    """User-confirmed mapping: master column name -> chosen input header (or null)."""
+
+    assignments: dict[str, str | None]
+
+
+class PreviewOut(BaseModel):
+    """A live look at the cleaned output, rows shaped to the master format."""
+
+    columns: list[str]
+    rows: list[list[str]]
+    total_rows: int
+
+
+# ---- Cleaning / review ----
+class TagGroup(BaseModel):
+    tag: str
+    label: str
+    count: int
+
+
+class CleanSummary(BaseModel):
+    total: int
+    clean: int
+    errors: int
+    auto_fixed: int  # number of cells auto-corrected
+    tags: list[TagGroup]
+    columns: list[str]  # active master columns, in order
+
+
+class ColumnProfile(BaseModel):
+    name: str
+    filled: int
+    blank: int
+    distinct: int
+    fixed: int  # cells meaningfully auto-corrected in this column
+    normalized: int  # cells only tidied (whitespace/case/unicode)
+    errors: int  # cells still flagged in this column
+    completeness: float  # 0..1
+    top_values: list[list]  # [[value, count], ...] for the most common values
+
+
+class DataProfile(BaseModel):
+    score: int  # 0..100 overall data-quality score
+    grade: str  # A+ .. F
+    total_rows: int
+    clean_rows: int
+    total_cells: int
+    clean_cells: int
+    fixed_cells: int  # meaningful corrections
+    normalized_cells: int  # cosmetic-only tidy-ups
+    error_cells: int
+    blank_cells: int
+    row_strip: list[int]  # per-row (possibly downsampled) worst status: 0 ok, 1 fixed, 2 error
+    strip_scale: int  # how many real rows each strip entry represents (1 = no downsampling)
+    columns: list[ColumnProfile]
+
+
+class CleanRowOut(BaseModel):
+    # Rows are computed in memory, identified by their position in the file.
+    row_index: int
+    status: str
+    values: dict
+    issues: list
+
+
+class ReviewOut(BaseModel):
+    """Single-request payload for the Review screen: summary + quality profile
+    + the requested page of rows."""
+
+    summary: CleanSummary
+    profile: DataProfile | None = None
+    rows: list[CleanRowOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class RowEdit(BaseModel):
+    values: dict[str, str]
+
+
+class BulkFix(BaseModel):
+    tag: str
+    column: str | None = None
+    action: str  # "set" | "drop"
+    value: str | None = None
+
+
+class CommitResult(BaseModel):
+    committed: int
+    skipped_errors: int

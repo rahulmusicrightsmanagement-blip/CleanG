@@ -1,29 +1,40 @@
-"""Password hashing (bcrypt) and JWT access tokens (PyJWT)."""
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-import jwt
+from jose import JWTError, jwt
 
-from .config import settings
+from .config import get_settings
+
+settings = get_settings()
 
 
-def hash_password(plain: str) -> str:
-    # bcrypt only uses the first 72 bytes; truncate to stay within the limit.
-    return bcrypt.hashpw(plain.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
+def _encode(password: str) -> bytes:
+    # bcrypt only uses the first 72 bytes; truncate to stay within its limit.
+    return password.encode("utf-8")[:72]
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(_encode(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("utf-8"))
-    except Exception:
-        return False
+    return bcrypt.checkpw(_encode(plain), hashed.encode("utf-8"))
 
 
 def create_access_token(subject: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_TTL_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.access_token_expire_minutes
+    )
     payload = {"sub": subject, "exp": expire}
-    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.ALGORITHM)
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
-def decode_token(token: str) -> dict:
-    return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.ALGORITHM])
+def decode_access_token(token: str) -> str | None:
+    """Return the subject (user id as string) or None if invalid/expired."""
+    try:
+        payload = jwt.decode(
+            token, settings.secret_key, algorithms=[settings.algorithm]
+        )
+        return payload.get("sub")
+    except JWTError:
+        return None

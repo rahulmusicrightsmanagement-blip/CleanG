@@ -1,24 +1,36 @@
-"""SQLAlchemy engine, session factory, and declarative base."""
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-from .config import settings
+from .config import get_settings
 
-is_sqlite = settings.DATABASE_URL.startswith("sqlite")
-connect_args = {"check_same_thread": False} if is_sqlite else {}
+settings = get_settings()
 
-# pool_pre_ping guards against dropped connections on serverless Postgres (Neon).
+
+def _normalize_url(url: str) -> str:
+    """Use the psycopg3 driver for plain postgres URLs (e.g. Neon strings)."""
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg://", 1)
+    return url
+
+
+# pool_pre_ping keeps Neon's serverless connections healthy across idle periods.
 engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args,
-    pool_pre_ping=not is_sqlite,
+    _normalize_url(settings.database_url),
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class Base(DeclarativeBase):
+    pass
 
 
 def get_db():
-    """FastAPI dependency yielding a request-scoped DB session."""
+    """FastAPI dependency that yields a database session per request."""
     db = SessionLocal()
     try:
         yield db
