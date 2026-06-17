@@ -1,55 +1,52 @@
-// Authentication state: token persistence, login/signup/logout, session restore.
-
 import { createContext, useContext, useEffect, useState } from "react";
-import { authApi } from "../api/auth";
-import { setToken, getToken } from "../api/client";
+import { api, getToken, setToken } from "../api/client.js";
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [booting, setBooting] = useState(true);
+  const [loading, setLoading] = useState(true);
 
-  // On load, if a token exists, confirm it's still valid.
+  // On load, if we have a token, fetch the current user to validate the session.
   useEffect(() => {
-    (async () => {
+    async function bootstrap() {
       if (!getToken()) {
-        setBooting(false);
+        setLoading(false);
         return;
       }
       try {
-        const me = await authApi.me();
-        setUser(me);
+        setUser(await api("/api/auth/me"));
       } catch {
         setToken(null);
       } finally {
-        setBooting(false);
+        setLoading(false);
       }
-    })();
+    }
+    bootstrap();
   }, []);
 
-  const login = async (email, password) => {
-    const res = await authApi.login(email, password);
-    setToken(res.access_token);
-    setUser({ email: res.email, role: res.role, name: res.name });
-  };
+  async function login(email, password) {
+    const { access_token } = await api("/api/auth/login", {
+      method: "POST",
+      auth: false,
+      body: { email, password },
+    });
+    setToken(access_token);
+    setUser(await api("/api/auth/me"));
+  }
 
-  const signup = async (email, password, name) => {
-    const res = await authApi.signup(email, password, name);
-    setToken(res.access_token);
-    setUser({ email: res.email, role: res.role, name: res.name });
-  };
-
-  const logout = () => {
+  function logout() {
     setToken(null);
     setUser(null);
-  };
+  }
 
   return (
-    <AuthContext.Provider value={{ user, booting, login, signup, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, logout }}>
       {children}
     </AuthContext.Provider>
   );
 }
 
-export const useAuth = () => useContext(AuthContext);
+export function useAuth() {
+  return useContext(AuthContext);
+}

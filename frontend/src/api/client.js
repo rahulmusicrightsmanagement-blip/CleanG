@@ -1,43 +1,36 @@
-// Thin fetch wrapper: base URL, bearer-token injection, JSON + error handling.
-
-const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 const TOKEN_KEY = "mrm_token";
 
-let token = localStorage.getItem(TOKEN_KEY) || null;
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
 
-export function setToken(t) {
-  token = t || null;
-  if (t) localStorage.setItem(TOKEN_KEY, t);
+export function setToken(token) {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
 }
-export function getToken() {
-  return token;
-}
 
-async function request(path, { method = "GET", body, isForm = false } = {}) {
-  const headers = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  let payload;
-  if (isForm) {
-    payload = body; // FormData — let the browser set the boundary header
-  } else if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    payload = JSON.stringify(body);
+/**
+ * Thin fetch wrapper that attaches the bearer token and throws on error
+ * responses with the server-provided detail message.
+ */
+export async function api(path, { method = "GET", body, auth = true } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (auth) {
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(BASE + path, { method, headers, body: payload });
+  const res = await fetch(path, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (res.status === 204) return null;
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = data.detail || data.message || `Request failed (${res.status})`;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    throw new Error(data.detail || `Request failed (${res.status})`);
   }
   return data;
 }
-
-export const api = {
-  get: (p) => request(p),
-  post: (p, b) => request(p, { method: "POST", body: b }),
-  postForm: (p, form) => request(p, { method: "POST", body: form, isForm: true }),
-  del: (p) => request(p, { method: "DELETE" }),
-};
