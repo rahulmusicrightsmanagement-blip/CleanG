@@ -1,11 +1,90 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy import select
+import io
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.orm import Session
 
+from ..core.master_store import record_to_dict
+from ..core.presets import (
+    ALL_COLUMNS,
+    FILTER_FIELD_COLUMNS,
+    FILTER_FIELDS,
+    NAME_SEP,
+    preset_payload,
+)
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import MasterColumn, User
-from ..schemas import MasterColumnOut
+from ..models import (
+    MASTER_COLUMN_TO_ATTR,
+    ActivityLog,
+    Branch,
+    MasterColumn,
+    MasterData,
+    User,
+    UserRole,
+)
+from ..schemas import (
+    ActivityLogOut,
+    ExportOptions,
+    ExportPreset,
+    ExportRequest,
+    FilterField,
+    MasterColumnOut,
+    MasterDataPage,
+    SuggestionOut,
+    VerifyRequest,
+    VerifyResult,
+    VerifyValue,
+)
+
+
+def _field_columns(key: str) -> list:
+    """The MasterData column objects a filter field searches.
+
+    `key` is a filter-field label (e.g. "Artist Name" -> Lead Artist + Singer),
+    or a raw master column name as a fallback."""
+    names = FILTER_FIELD_COLUMNS.get(key)
+    if names is None:
+        if key in MASTER_COLUMN_TO_ATTR:
+            names = [key]
+        else:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown filter field: {key!r}"
+            )
+    return [getattr(MasterData, MASTER_COLUMN_TO_ATTR[n]) for n in names]
+
+
+def _value_match(key: str, value: str):
+    """A condition: ANY of the field's columns CONTAINS `value` (case-insensitive).
+
+    Contains-matching is what makes a single name find a multi-name cell such as
+    "Sonu Nigam | Shaan", and ignores case/spacing differences."""
+    return or_(*(c.ilike(f"%{value}%") for c in _field_columns(key)))
+
+
+def _filtered_query(filters: dict[str, list[str]]):
+    """A MasterData SELECT narrowed by `filters` (OR within a field, AND across)."""
+    stmt = select(MasterData)
+    for field, values in filters.items():
+        vals = [v for v in values if v.strip()]
+        if not vals:
+            continue
+        stmt = stmt.where(or_(*(_value_match(field, v) for v in vals)))
+    return stmt
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _attr(col: str) -> str:
+    """Master column name -> MasterData attribute, or 422 if unknown."""
+    attr = MASTER_COLUMN_TO_ATTR.get(col)
+    if attr is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown column: {col!r}"
+        )
+    return attr
 
 router = APIRouter(prefix="/api/master", tags=["master"])
 
@@ -17,3 +96,203 @@ def master_columns(
 ):
     """The canonical output schema every cleaned file is mapped onto."""
     return db.scalars(select(MasterColumn).order_by(MasterColumn.position)).all()
+
+
+@router.get("/data", response_model=MasterDataPage)
+def master_data(
+    fields: str | None = Query(
+        None, description="Comma-separated master column names to extract (default: all)."
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Extract stored master records, optionally projected to just the fields
+    asked for — the structured table makes any field a cheap column read."""
+    columns = None
+    if fields:
+        wanted = [c.strip() for c in fields.split(",") if c.strip()]
+        columns = [c for c in wanted if c in MASTER_COLUMN_TO_ATTR]
+    total = db.scalar(select(func.count()).select_from(MasterData)) or 0
+    recs = db.scalars(
+        select(MasterData).order_by(MasterData.id).offset(offset).limit(limit)
+    ).all()
+    return MasterDataPage(
+        columns=columns or list(MASTER_COLUMN_TO_ATTR),
+        rows=[record_to_dict(r, columns) for r in recs],
+        total=total,
+    )
+
+
+@router.get("/export/options", response_model=ExportOptions)
+def export_options(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Everything the Export tab needs: presets (with their appendable custom
+    columns), the full column list for a fully-custom export, and the fields the
+    user can pre-filter on."""
+    total = db.scalar(select(func.count()).select_from(MasterData)) or 0
+    return ExportOptions(
+        presets=[ExportPreset(**p) for p in preset_payload()],
+        all_columns=list(ALL_COLUMNS),
+        filter_fields=[
+            FilterField(key=label, label=label, columns=cols)
+            for label, cols in FILTER_FIELDS
+        ],
+        total_records=total,
+    )
+
+
+@router.get("/suggest", response_model=list[SuggestionOut])
+def suggest_values(
+    field: str = Query(..., description="Filter field (label) to suggest values for."),
+    q: str = Query("", description="Substring the user has typed so far."),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Autocomplete: individual values that exist in the master data for `field`,
+    each with its record count.
+
+    Multi-name cells ("Sonu Nigam | Shaan") are split so each performer is
+    suggested on its own, and matches are searched across every column the field
+    covers (e.g. Artist Name -> Lead Artist + Singer). The count (which includes
+    rows where the name shares a cell with others) makes spelling variants like
+    "Shreya Ghosal" vs "Shreya Ghoshal" visible, so none of an artist's songs get
+    missed — add every relevant variant and the filter ORs them together."""
+    ql = q.strip().lower()
+    found: dict[str, str] = {}  # lower -> display, dedup while preserving casing
+    for col in _field_columns(field):
+        stmt = select(distinct(col)).where(col != "")
+        if ql:
+            stmt = stmt.where(func.lower(col).like(f"%{ql}%"))
+        for cell in db.scalars(stmt.limit(400)):
+            for part in str(cell).split(NAME_SEP):
+                part = part.strip()
+                if not part:
+                    continue
+                if ql and ql not in part.lower():
+                    continue
+                found.setdefault(part.lower(), part)
+        if len(found) >= limit * 4:
+            break
+
+    names = sorted(found.values(), key=str.lower)[:limit]
+    out = [
+        SuggestionOut(
+            value=n,
+            count=db.scalar(
+                select(func.count()).select_from(MasterData).where(_value_match(field, n))
+            ) or 0,
+        )
+        for n in names
+    ]
+    # Most common spelling first — it's the one the user most likely wants.
+    out.sort(key=lambda s: (-s.count, s.value.lower()))
+    return out
+
+
+@router.post("/verify", response_model=VerifyResult)
+def verify_filters(
+    payload: VerifyRequest,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Check whether the entered filter values exist in the master data before
+    letting the user proceed to pick a preset / export.
+
+    Each entered value is checked individually (does it occur at all?), and the
+    combined filter is counted (do any rows match everything together?)."""
+    values: list[VerifyValue] = []
+    all_values_present = True
+
+    for field, vals in payload.filters.items():
+        for v in vals:
+            if not v.strip():
+                continue
+            count = db.scalar(
+                select(func.count())
+                .select_from(MasterData)
+                .where(_value_match(field, v))
+            ) or 0
+            values.append(
+                VerifyValue(column=field, value=v, available=count > 0, count=count)
+            )
+            if count == 0:
+                all_values_present = False
+
+    if not values:
+        return VerifyResult(
+            available=False, total=0, values=[],
+            message="Enter at least one value to verify.",
+        )
+
+    total = db.scalar(
+        select(func.count()).select_from(_filtered_query(payload.filters).subquery())
+    ) or 0
+
+    if not all_values_present:
+        missing = [
+            f"“{x.value}” ({x.column})"
+            for x in values if not x.available
+        ]
+        message = f"Not found in the master data: {', '.join(missing)}."
+        available = False
+    elif total == 0:
+        message = "Each value exists, but no record matches all the filters together."
+        available = False
+    else:
+        message = f"{total} record{'s' if total != 1 else ''} match your filters."
+        available = True
+
+    return VerifyResult(available=available, total=total, values=values, message=message)
+
+
+@router.post("/export")
+def export_master(
+    payload: ExportRequest,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Stream the selected columns of the (optionally filtered) master data as xlsx."""
+    if not payload.columns:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one column to export."
+        )
+    # Validate + resolve every requested column up front.
+    cols = [(c, _attr(c)) for c in payload.columns]
+    stmt = _filtered_query(payload.filters).order_by(MasterData.id)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (payload.sheet_name or "Master data")[:31]
+    ws.append([c for c, _ in cols])
+    for rec in db.scalars(stmt):
+        ws.append([getattr(rec, attr) or "" for _, attr in cols])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"{(payload.sheet_name or 'master_export').replace(' ', '_')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/activity", response_model=list[ActivityLogOut])
+def activity_log(
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Per-branch audit of every save into the master dataset. Admins see all;
+    regular users see only activity from their own branches."""
+    stmt = select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(limit)
+    if user.role != UserRole.admin:
+        owned = select(Branch.id).where(Branch.owner_id == user.id)
+        stmt = stmt.where(ActivityLog.branch_id.in_(owned))
+    return db.scalars(stmt).all()

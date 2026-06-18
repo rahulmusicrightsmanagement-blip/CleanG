@@ -49,6 +49,9 @@ export default function Layout() {
           <NavLink to="/" end>
             <Icon name="branch" size={16} /> Branches
           </NavLink>
+          <NavLink to="/export">
+            <Icon name="download" size={16} /> Export
+          </NavLink>
           {user?.role === "admin" && (
             <NavLink to="/users">
               <Icon name="users" size={16} /> Users

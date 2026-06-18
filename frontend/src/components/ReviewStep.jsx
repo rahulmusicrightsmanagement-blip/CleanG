@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../api/client.js";
+import { Link } from "react-router-dom";
+import { api, download } from "../api/client.js";
 import Icon from "./Icon.jsx";
 import QualityCockpit from "./QualityCockpit.jsx";
 
@@ -51,6 +52,9 @@ export default function ReviewStep({ file, onCommitted }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [committed, setCommitted] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [exporting, setExporting] = useState(false);
 
   // Headers come straight from the mapping we already have, so the grid frame
   // renders instantly instead of waiting on the network.
@@ -202,31 +206,85 @@ export default function ReviewStep({ file, onCommitted }) {
 
   async function commit() {
     setBusy(true);
+    setSaving(true);
+    setProgress(6);
     setError("");
+    // The save is a single request, so we animate an indeterminate bar that
+    // creeps toward ~92% while the server de-duplicates and writes, then snaps
+    // to 100% on success — so the user can see it's working, not frozen.
+    const timer = setInterval(() => {
+      setProgress((p) => (p >= 92 ? 92 : p + Math.max(1, (92 - p) * 0.08)));
+    }, 280);
     try {
       const res = await api(`/api/files/${file.id}/commit`, { method: "POST" });
-      setCommitted(res);
-      onCommitted?.({ ...file, status: "committed" });
+      clearInterval(timer);
+      setProgress(100);
+      // Let the full bar register before swapping to the success screen.
+      setTimeout(() => {
+        setSaving(false);
+        setCommitted(res);
+        onCommitted?.({ ...file, status: "committed" });
+      }, 450);
     } catch (err) {
+      clearInterval(timer);
+      setSaving(false);
+      setProgress(0);
       setError(err.message);
     } finally {
       setBusy(false);
     }
   }
 
-  if (committed) {
+  async function exportFlagged() {
+    setExporting(true);
+    setError("");
+    try {
+      await download(
+        `/api/files/${file.id}/export?view=error`,
+        `flagged_rows_${file.id}.xlsx`
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // Already saved on a previous visit — show the saved state, not the editable
+  // grid, so the same cleaned data isn't offered up for re-saving.
+  const alreadySaved = !committed && file.status === "committed";
+
+  if (committed || alreadySaved) {
+    const c = committed; // null when arriving at an already-committed batch
     return (
-      <div className="card empty">
-        <div className="success-mark">
-          <Icon name="check" size={32} />
+      <div className="theme-light review-page">
+        <div className="card empty">
+          <div className="success-mark">
+            <Icon name="check" size={32} />
+          </div>
+          <h2>Saved to the master dataset</h2>
+          {c ? (
+            <p className="muted">
+              {c.inserted} new record{c.inserted !== 1 ? "s" : ""} added
+              {c.updated > 0 &&
+                ` · ${c.updated} existing record${c.updated !== 1 ? "s" : ""} updated to the latest label/publisher`}
+              {c.duplicates > 0 &&
+                ` · ${c.duplicates} already in the master data (skipped, not stored twice)`}
+              {c.skipped_errors > 0 &&
+                ` · ${c.skipped_errors} row(s) still had errors and were skipped`}
+              .
+            </p>
+          ) : (
+            <p className="muted">
+              This batch has already been saved to the master dataset, so it
+              isn’t shown again here.
+            </p>
+          )}
+          <Link className="btn primary" to="/" style={{ marginTop: "0.75rem" }}>
+            <Icon name="arrowRight" size={16} />
+            Back to home
+          </Link>
         </div>
-        <h2>Saved to the master dataset</h2>
-        <p className="muted">
-          {committed.committed} clean record{committed.committed !== 1 ? "s" : ""} added
-          {committed.skipped_errors > 0 &&
-            ` · ${committed.skipped_errors} row(s) still had errors and were skipped`}
-          .
-        </p>
       </div>
     );
   }
@@ -235,6 +293,23 @@ export default function ReviewStep({ file, onCommitted }) {
 
   return (
     <div className="theme-light review-page">
+      {saving && (
+        <div className="save-overlay">
+          <div className="save-modal">
+            <div className="save-spark">
+              <Icon name="sparkles" size={22} />
+            </div>
+            <h3>Saving to the master dataset…</h3>
+            <div className="save-progress">
+              <span style={{ width: `${progress}%` }} />
+            </div>
+            <p className="muted small">
+              {Math.round(progress)}% · de-duplicating and writing records
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="page-head">
         <div>
           <h1>Review &amp; save</h1>
@@ -321,6 +396,24 @@ export default function ReviewStep({ file, onCommitted }) {
           Clean ({summary?.clean ?? 0})
         </button>
       </div>
+
+      {/* Export the flagged rows — pull every row that needs review into Excel,
+          or keep editing inline below. */}
+      {view === "error" && (
+        <div className="export-bar">
+          <span className="muted small">
+            Export every flagged row to Excel, or fix them inline below.
+          </span>
+          <button
+            className="btn sm"
+            onClick={exportFlagged}
+            disabled={exporting || (summary?.errors ?? 0) === 0}
+          >
+            <Icon name="download" size={15} />
+            {exporting ? "Exporting…" : "Export to Excel"}
+          </button>
+        </div>
+      )}
 
       {/* Colour-coded error legend + bulk fixer */}
       {view === "error" && summary && summary.tags.length > 0 && (

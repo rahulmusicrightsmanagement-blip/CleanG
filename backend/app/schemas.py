@@ -65,6 +65,80 @@ class MasterColumnOut(BaseModel):
     name: str
 
 
+class MasterDataPage(BaseModel):
+    """A page of stored master records, projected to the requested columns."""
+
+    columns: list[str]
+    rows: list[dict]
+    total: int
+
+
+class ActivityLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    branch_id: int
+    file_id: int
+    action: str
+    inserted: int
+    updated: int
+    duplicates: int
+    skipped_errors: int
+    created_at: datetime
+
+
+# ---- Export ----
+class ExportPreset(BaseModel):
+    key: str  # PDL | SVF
+    label: str
+    columns: list[str]  # the preset's base columns, in order
+    custom_columns: list[str]  # master columns NOT in the preset (appendable)
+
+
+class FilterField(BaseModel):
+    key: str  # identifier sent back in `filters` (equals the label)
+    label: str  # what the user sees (e.g. "Artist Name")
+    columns: list[str]  # master columns it searches (OR, contains-match)
+
+
+class SuggestionOut(BaseModel):
+    value: str  # a single value as it appears in the data
+    count: int  # how many records carry it (incl. inside multi-value cells)
+
+
+class ExportOptions(BaseModel):
+    presets: list[ExportPreset]
+    all_columns: list[str]  # every master column, in order (for fully-custom export)
+    filter_fields: list[FilterField]
+    total_records: int
+
+
+class ExportRequest(BaseModel):
+    # Final ordered list of master columns to export (preset + extras, or custom).
+    columns: list[str]
+    # Pre-filter: master column -> accepted values (OR within a field, AND across).
+    filters: dict[str, list[str]] = {}
+    sheet_name: str | None = None
+
+
+class VerifyRequest(BaseModel):
+    filters: dict[str, list[str]] = {}
+
+
+class VerifyValue(BaseModel):
+    column: str
+    value: str
+    available: bool
+    count: int
+
+
+class VerifyResult(BaseModel):
+    available: bool  # every entered value exists AND the combined filter matches rows
+    total: int  # rows matching ALL the entered filters together
+    values: list[VerifyValue]
+    message: str
+
+
 # ---- Mapping / uploaded files ----
 class MappingItem(BaseModel):
     master_column: str
@@ -201,5 +275,8 @@ class BulkFix(BaseModel):
 
 
 class CommitResult(BaseModel):
-    committed: int
+    committed: int  # inserted + updated (records actually written this save)
     skipped_errors: int
+    inserted: int = 0  # brand-new records added to the master dataset
+    updated: int = 0  # existing records refreshed to a new owner (label/publisher)
+    duplicates: int = 0  # already present, identical — not stored again

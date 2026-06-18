@@ -4,6 +4,7 @@ import Layout from "./components/Layout.jsx";
 import Login from "./pages/Login.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Branch from "./pages/Branch.jsx";
+import Export from "./pages/Export.jsx";
 import AdminUsers from "./pages/AdminUsers.jsx";
 
 function RequireAuth({ children, adminOnly = false }) {
@@ -19,6 +20,8 @@ export default function App() {
   const { user } = useAuth();
 
   return (
+    <>
+      <span className="made-by">Developed By SK and Rahul</span>
     <Routes>
       <Route
         path="/login"
@@ -33,6 +36,7 @@ export default function App() {
       >
         <Route path="/" element={<Dashboard />} />
         <Route path="/branches/:branchId" element={<Branch />} />
+        <Route path="/export" element={<Export />} />
         <Route
           path="/users"
           element={
@@ -44,5 +48,6 @@ export default function App() {
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    </>
   );
 }

@@ -1,7 +1,10 @@
+import io
 import json
 from collections import Counter
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
 
@@ -13,12 +16,13 @@ from ..core.cleaning import (
     mark_duplicates,
     revalidate,
 )
+from ..core.master_store import upsert_master_records
 from ..database import get_db
 from ..deps import get_current_user
 from ..models import (
+    ActivityLog,
     Branch,
     FileStatus,
-    MasterRecord,
     UploadedFile,
     User,
     UserRole,
@@ -407,6 +411,51 @@ def clean_rows(
     return [_row_out(r) for r in rows[offset : offset + limit]]
 
 
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@router.get("/api/files/{file_id}/export")
+def export_rows(
+    file_id: int,
+    view: str = "error",
+    tag: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Download the rows of a given view as an .xlsx workbook.
+
+    Defaults to the flagged ("error") rows so a reviewer can pull every row that
+    needs attention into Excel, each annotated with what's wrong. The sheet is
+    built in memory and streamed — nothing is written to disk.
+    """
+    f = _get_file_or_404(file_id, user, db)
+    rows = _filter_rows(build_rows(f), view, tag)
+    cols = _active_columns(f)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Flagged rows" if view == "error" else "Rows"
+    ws.append(["Row", *cols, "Issues"])
+    for r in rows:
+        issues = "; ".join(
+            f"{i['column']}: {i.get('message') or i.get('tag')}"
+            for i in r.issues
+            if i.get("action") == "error"
+        )
+        ws.append([r.index + 1, *[r.values.get(c, "") for c in cols], issues])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    label = "flagged_rows" if view == "error" else f"{view}_rows"
+    filename = f"{label}_file{file_id}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.put("/api/files/{file_id}/rows/{row_index}", response_model=CleanRowOut)
 def edit_row(
     file_id: int,
@@ -484,16 +533,33 @@ def commit_clean(
 ):
     """Save all clean rows into the master dataset. Rows with errors are skipped.
 
-    This is the only point at which cleaned data is written to the database.
+    Cleaned rows land in the structured `master_data` table (one queryable
+    column per master field), de-duplicated against everything already stored:
+    an identical recording is not saved twice, and a row that matches except for
+    its Label / Publisher / Distributor updates the existing record to the latest
+    owner. Each save is recorded in the per-branch activity log.
     """
     f = _get_file_or_404(file_id, user, db)
     rows = build_rows(f)
     clean = [r for r in rows if r.status == "clean"]
     errors = len(rows) - len(clean)
 
-    db.add_all(
-        MasterRecord(branch_id=f.branch_id, file_id=f.id, data=r.values) for r in clean
-    )
+    counts = upsert_master_records(db, f.branch_id, f.id, [r.values for r in clean])
+    db.add(ActivityLog(
+        branch_id=f.branch_id,
+        file_id=f.id,
+        action="commit",
+        inserted=counts["inserted"],
+        updated=counts["updated"],
+        duplicates=counts["duplicates"],
+        skipped_errors=errors,
+    ))
     f.status = FileStatus.committed
     db.commit()
-    return CommitResult(committed=len(clean), skipped_errors=errors)
+    return CommitResult(
+        committed=counts["inserted"] + counts["updated"],
+        skipped_errors=errors,
+        inserted=counts["inserted"],
+        updated=counts["updated"],
+        duplicates=counts["duplicates"],
+    )
