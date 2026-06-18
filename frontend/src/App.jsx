@@ -21,7 +21,7 @@ export default function App() {
 
   return (
     <>
-      <span className="made-by">Developed By SK and Rahul</span>
+      <span className="made-by">Developed By Rahul and SK</span>
     <Routes>
       <Route
         path="/login"
