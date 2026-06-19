@@ -6,6 +6,7 @@ from openpyxl import Workbook
 from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.orm import Session
 
+from ..core.http import content_disposition
 from ..core.master_store import record_to_dict
 from ..core.presets import (
     ALL_COLUMNS,
@@ -64,9 +65,30 @@ def _value_match(key: str, value: str):
     return or_(*(c.ilike(f"%{value}%") for c in _field_columns(key)))
 
 
-def _filtered_query(filters: dict[str, list[str]]):
-    """A MasterData SELECT narrowed by `filters` (OR within a field, AND across)."""
-    stmt = select(MasterData)
+def _scope(stmt, user: User):
+    """Restrict a MasterData query to the records a user may see.
+
+    Admins see every committed record; a regular user only sees records whose
+    owning branch belongs to them. Without this, any authenticated user could
+    read/export the entire master dataset across all tenants.
+    """
+    if user.role != UserRole.admin:
+        owned = select(Branch.id).where(Branch.owner_id == user.id)
+        stmt = stmt.where(MasterData.branch_id.in_(owned))
+    return stmt
+
+
+def _scoped_count(db: Session, user: User, *conditions) -> int:
+    stmt = select(func.count()).select_from(MasterData)
+    for cond in conditions:
+        stmt = stmt.where(cond)
+    return db.scalar(_scope(stmt, user)) or 0
+
+
+def _filtered_query(filters: dict[str, list[str]], user: User):
+    """A MasterData SELECT narrowed by `filters` (OR within a field, AND across),
+    scoped to the records `user` is allowed to see."""
+    stmt = _scope(select(MasterData), user)
     for field, values in filters.items():
         vals = [v for v in values if v.strip()]
         if not vals:
@@ -106,7 +128,7 @@ def master_data(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Extract stored master records, optionally projected to just the fields
     asked for — the structured table makes any field a cheap column read."""
@@ -114,9 +136,12 @@ def master_data(
     if fields:
         wanted = [c.strip() for c in fields.split(",") if c.strip()]
         columns = [c for c in wanted if c in MASTER_COLUMN_TO_ATTR]
-    total = db.scalar(select(func.count()).select_from(MasterData)) or 0
+    total = _scoped_count(db, user)
     recs = db.scalars(
-        select(MasterData).order_by(MasterData.id).offset(offset).limit(limit)
+        _scope(select(MasterData), user)
+        .order_by(MasterData.id)
+        .offset(offset)
+        .limit(limit)
     ).all()
     return MasterDataPage(
         columns=columns or list(MASTER_COLUMN_TO_ATTR),
@@ -128,12 +153,12 @@ def master_data(
 @router.get("/export/options", response_model=ExportOptions)
 def export_options(
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Everything the Export tab needs: presets (with their appendable custom
     columns), the full column list for a fully-custom export, and the fields the
     user can pre-filter on."""
-    total = db.scalar(select(func.count()).select_from(MasterData)) or 0
+    total = _scoped_count(db, user)
     return ExportOptions(
         presets=[ExportPreset(**p) for p in preset_payload()],
         all_columns=list(ALL_COLUMNS),
@@ -151,7 +176,7 @@ def suggest_values(
     q: str = Query("", description="Substring the user has typed so far."),
     limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Autocomplete: individual values that exist in the master data for `field`,
     each with its record count.
@@ -165,7 +190,7 @@ def suggest_values(
     ql = q.strip().lower()
     found: dict[str, str] = {}  # lower -> display, dedup while preserving casing
     for col in _field_columns(field):
-        stmt = select(distinct(col)).where(col != "")
+        stmt = _scope(select(distinct(col)), user).where(col != "")
         if ql:
             stmt = stmt.where(func.lower(col).like(f"%{ql}%"))
         for cell in db.scalars(stmt.limit(400)):
@@ -183,9 +208,7 @@ def suggest_values(
     out = [
         SuggestionOut(
             value=n,
-            count=db.scalar(
-                select(func.count()).select_from(MasterData).where(_value_match(field, n))
-            ) or 0,
+            count=_scoped_count(db, user, _value_match(field, n)),
         )
         for n in names
     ]
@@ -198,7 +221,7 @@ def suggest_values(
 def verify_filters(
     payload: VerifyRequest,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Check whether the entered filter values exist in the master data before
     letting the user proceed to pick a preset / export.
@@ -212,11 +235,7 @@ def verify_filters(
         for v in vals:
             if not v.strip():
                 continue
-            count = db.scalar(
-                select(func.count())
-                .select_from(MasterData)
-                .where(_value_match(field, v))
-            ) or 0
+            count = _scoped_count(db, user, _value_match(field, v))
             values.append(
                 VerifyValue(column=field, value=v, available=count > 0, count=count)
             )
@@ -230,7 +249,9 @@ def verify_filters(
         )
 
     total = db.scalar(
-        select(func.count()).select_from(_filtered_query(payload.filters).subquery())
+        select(func.count()).select_from(
+            _filtered_query(payload.filters, user).subquery()
+        )
     ) or 0
 
     if not all_values_present:
@@ -254,7 +275,7 @@ def verify_filters(
 def export_master(
     payload: ExportRequest,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Stream the selected columns of the (optionally filtered) master data as xlsx."""
     if not payload.columns:
@@ -263,7 +284,7 @@ def export_master(
         )
     # Validate + resolve every requested column up front.
     cols = [(c, _attr(c)) for c in payload.columns]
-    stmt = _filtered_query(payload.filters).order_by(MasterData.id)
+    stmt = _filtered_query(payload.filters, user).order_by(MasterData.id)
 
     wb = Workbook()
     ws = wb.active
@@ -279,7 +300,7 @@ def export_master(
     return StreamingResponse(
         buf,
         media_type=_XLSX_MIME,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename, "master_export.xlsx")},
     )
 
 

@@ -1,28 +1,15 @@
-const TOKEN_KEY = "mrm_token";
-
-export function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
-}
-
 /**
- * Thin fetch wrapper that attaches the bearer token and throws on error
- * responses with the server-provided detail message.
+ * Thin fetch wrapper. Auth is carried by an httpOnly session cookie set by the
+ * server on login — the token is never stored in JS (so XSS can't read it), so
+ * every request just needs `credentials: "include"` to send the cookie.
  */
-export async function api(path, { method = "GET", body, auth = true } = {}) {
+export async function api(path, { method = "GET", body } = {}) {
   const headers = { "Content-Type": "application/json" };
-  if (auth) {
-    const token = getToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  }
 
   const res = await fetch(path, {
     method,
     headers,
+    credentials: "include",
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -36,21 +23,21 @@ export async function api(path, { method = "GET", body, auth = true } = {}) {
 }
 
 /**
- * Authenticated file download. Fetches the path as a blob (attaching the bearer
- * token) and triggers a browser "save as" using the server-supplied filename.
+ * Authenticated file download. Fetches the path as a blob (the session cookie is
+ * sent automatically) and triggers a browser "save as" using the server-supplied
+ * filename.
  */
 export async function download(
   path,
   fallbackName = "download.xlsx",
   { method = "GET", body } = {}
 ) {
-  const token = getToken();
   const headers = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
   if (body) headers["Content-Type"] = "application/json";
   const res = await fetch(path, {
     method,
     headers,
+    credentials: "include",
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
