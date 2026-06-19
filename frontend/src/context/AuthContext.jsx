@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import { api, getToken, setToken } from "../api/client.js";
+import { api } from "../api/client.js";
 
 const AuthContext = createContext(null);
 
@@ -7,17 +7,15 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // On load, if we have a token, fetch the current user to validate the session.
+  // On load, ask the server who we are. The session lives in an httpOnly cookie,
+  // so a valid cookie resolves the user; otherwise /me returns 401 and we stay
+  // logged out.
   useEffect(() => {
     async function bootstrap() {
-      if (!getToken()) {
-        setLoading(false);
-        return;
-      }
       try {
         setUser(await api("/api/auth/me"));
       } catch {
-        setToken(null);
+        setUser(null);
       } finally {
         setLoading(false);
       }
@@ -26,17 +24,20 @@ export function AuthProvider({ children }) {
   }, []);
 
   async function login(email, password) {
-    const { access_token } = await api("/api/auth/login", {
+    // The server sets the httpOnly session cookie and returns the user.
+    const me = await api("/api/auth/login", {
       method: "POST",
-      auth: false,
       body: { email, password },
     });
-    setToken(access_token);
-    setUser(await api("/api/auth/me"));
+    setUser(me);
   }
 
-  function logout() {
-    setToken(null);
+  async function logout() {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Even if the revoke call fails, drop the local session.
+    }
     setUser(null);
   }
 

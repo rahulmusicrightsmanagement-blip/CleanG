@@ -1,12 +1,15 @@
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import select, text
+from starlette.responses import Response
 
 from .config import get_settings
+from .core.limiter import limiter
 from .database import Base, SessionLocal, engine
 from .models import MasterColumn, User, UserRole
 from .routers import auth, branches, clean, files, master, users
@@ -48,6 +51,19 @@ def _migrate(db) -> None:
         "ALTER TABLE uploaded_files "
         "ADD COLUMN IF NOT EXISTS dropped JSONB NOT NULL DEFAULT '[]'::jsonb"
     ))
+    # Token-revocation + brute-force-lockout columns for pre-existing user tables.
+    db.execute(text(
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"
+    ))
+    db.execute(text(
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS failed_logins INTEGER NOT NULL DEFAULT 0"
+    ))
+    db.execute(text(
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"
+    ))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.
     db.execute(text("DROP TABLE IF EXISTS cleaned_rows"))
@@ -82,15 +98,49 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> Response:
+    return Response(
+        '{"detail":"Too many requests. Please slow down and try again."}',
+        status_code=429,
+        media_type="application/json",
+    )
+
+
 app = FastAPI(title="MRM Cleanser API", version="0.1.0", lifespan=lifespan)
+
+# Rate limiting (slowapi): the limiter is shared via app.core.limiter so routers
+# can decorate individual endpoints (e.g. login) with @limiter.limit(...).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    # API responses never need to be embedded or to load remote resources.
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    # Ignored over plain HTTP; enforced once the app is served behind TLS.
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for key, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    return response
+
 
 app.include_router(auth.router)
 app.include_router(users.router)

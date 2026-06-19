@@ -1,5 +1,4 @@
 import { useRef, useState } from "react";
-import { getToken } from "../api/client.js";
 import Icon from "./Icon.jsx";
 
 const MAX_BYTES = 20 * 1024 * 1024; // keep in sync with the backend cap
@@ -56,7 +55,8 @@ export default function UploadStep({ branchId, existing, onUploaded }) {
     const xhr = new XMLHttpRequest();
     xhrRef.current = xhr;
     xhr.open("POST", `/api/branches/${branchId}/files`);
-    xhr.setRequestHeader("Authorization", `Bearer ${getToken()}`);
+    // Send the httpOnly session cookie with the upload.
+    xhr.withCredentials = true;
 
     // Real byte-for-byte upload progress.
     xhr.upload.onprogress = (e) => {

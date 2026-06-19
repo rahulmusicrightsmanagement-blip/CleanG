@@ -83,8 +83,13 @@ export default function AdminUsers() {
               type="text"
               value={form.password}
               onChange={(e) => update("password", e.target.value)}
+              minLength={12}
               required
             />
+            <small className="muted">
+              Min 12 characters, with an uppercase letter, a lowercase letter and
+              a digit.
+            </small>
           </label>
           <label>
             Role

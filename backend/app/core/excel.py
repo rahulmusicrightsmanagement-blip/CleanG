@@ -8,12 +8,21 @@ Validation rules for an uploaded input file:
   - header cells are non-empty and unique  (clean, mappable headers)
 """
 
+import zipfile
 from dataclasses import dataclass, field
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_BYTES = 20 * 1024 * 1024  # 20 MB compressed (enforced in the router)
+# An .xlsx is a zip; a small file can inflate to gigabytes ("zip bomb"). Reject
+# anything whose uncompressed payload, or expansion ratio, is implausible for a
+# real spreadsheet before openpyxl ever parses it.
+MAX_UNCOMPRESSED = 400 * 1024 * 1024  # 400 MB total inflated
+MAX_COMPRESSION_RATIO = 200
+# Structural caps so a (valid) but enormous sheet can't exhaust memory.
+MAX_DATA_ROWS = 1_000_000
+MAX_COLUMNS = 1_000
 
 
 def _cell_to_str(v) -> str:
@@ -59,7 +68,45 @@ def _first_data_row(ws) -> int:
     return 0
 
 
+def _guard_zip_bomb(source) -> None:
+    """Reject decompression bombs before openpyxl parses the workbook."""
+    try:
+        with zipfile.ZipFile(source) as zf:
+            total_uncompressed = 0
+            total_compressed = 0
+            for info in zf.infolist():
+                total_uncompressed += info.file_size
+                total_compressed += info.compress_size
+            if total_uncompressed > MAX_UNCOMPRESSED:
+                raise ExcelValidationError(
+                    "too_large",
+                    "The file expands to an unreasonable size when opened and was "
+                    "rejected as a potential decompression bomb.",
+                )
+            if (
+                total_compressed > 0
+                and total_uncompressed / total_compressed > MAX_COMPRESSION_RATIO
+            ):
+                raise ExcelValidationError(
+                    "too_large",
+                    "The file has an abnormal compression ratio and was rejected "
+                    "as a potential decompression bomb.",
+                )
+    except zipfile.BadZipFile:
+        raise ExcelValidationError(
+            "corrupted",
+            "The file could not be opened. It may be corrupted or not a valid "
+            ".xlsx file.",
+        )
+    finally:
+        if hasattr(source, "seek"):
+            source.seek(0)
+
+
 def read_and_validate(source) -> SheetInfo:
+    # --- decompression-bomb guard (before any XML parsing) -----------------
+    _guard_zip_bomb(source)
+
     # --- corruption / unreadable -------------------------------------------
     try:
         wb = load_workbook(source, read_only=False, data_only=True)
@@ -118,6 +165,11 @@ def read_and_validate(source) -> SheetInfo:
         )
     if not headers:
         raise ExcelValidationError("no_data", "No column headers were found.")
+    if len(headers) > MAX_COLUMNS:
+        raise ExcelValidationError(
+            "too_large",
+            f"The sheet has more than {MAX_COLUMNS} columns, which is not supported.",
+        )
 
     # --- extract data rows (JSON-safe strings) ------------------------------
     n_cols = len(headers)
@@ -127,6 +179,12 @@ def read_and_validate(source) -> SheetInfo:
             continue  # skip fully blank rows
         cells = list(row[:n_cols]) + [None] * (n_cols - len(row[:n_cols]))
         data_rows.append([_cell_to_str(v) for v in cells])
+        if len(data_rows) > MAX_DATA_ROWS:
+            raise ExcelValidationError(
+                "too_large",
+                f"The sheet has more than {MAX_DATA_ROWS:,} data rows, which is "
+                "not supported.",
+            )
     if not data_rows:
         raise ExcelValidationError(
             "no_data", "The file has headers but no data rows."

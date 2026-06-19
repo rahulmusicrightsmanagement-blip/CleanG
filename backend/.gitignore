@@ -1,8 +1,15 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 venv/
 .venv/
 *.egg-info/
 .pytest_cache/
 storage/
+
+# Local databases — never commit (may carry password hashes / real data).
+*.db
+*.sqlite
+*.sqlite3
