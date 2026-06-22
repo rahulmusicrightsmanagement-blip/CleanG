@@ -106,6 +106,9 @@ class UploadedFile(Base):
     corrections: Mapped[dict] = mapped_column(JSON, default=dict)
     # Row indexes the reviewer dropped (excluded from output and the master save).
     dropped: Mapped[list] = mapped_column(JSON, default=list)
+    # Row indexes the reviewer accepted as-is: their flags are cleared and the
+    # values kept unchanged (a deliberate "keep this data" override).
+    accepted: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[FileStatus] = mapped_column(
         Enum(FileStatus, name="file_status"), default=FileStatus.uploaded
     )

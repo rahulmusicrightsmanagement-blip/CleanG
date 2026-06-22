@@ -48,6 +48,10 @@ def _migrate(db) -> None:
         "ALTER TABLE uploaded_files "
         "ADD COLUMN IF NOT EXISTS dropped JSONB NOT NULL DEFAULT '[]'::jsonb"
     ))
+    db.execute(text(
+        "ALTER TABLE uploaded_files "
+        "ADD COLUMN IF NOT EXISTS accepted JSONB NOT NULL DEFAULT '[]'::jsonb"
+    ))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.
     db.execute(text("DROP TABLE IF EXISTS cleaned_rows"))

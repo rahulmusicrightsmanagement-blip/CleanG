@@ -1,10 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import Branch, FileStatus, UploadedFile, User, UserRole
+from ..models import (
+    ActivityLog,
+    Branch,
+    FileStatus,
+    MasterData,
+    MasterRecord,
+    UploadedFile,
+    User,
+    UserRole,
+)
 from ..schemas import BranchCreate, BranchOut
 
 router = APIRouter(prefix="/api/branches", tags=["branches"])
@@ -107,3 +116,31 @@ def create_branch(
     db.commit()
     db.refresh(branch)
     return _to_out(branch, {})
+
+
+@router.delete("/{branch_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_branch(
+    branch_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Permanently delete a branch and everything stored under it. Admin-only.
+
+    The committed master records, audit log and uploaded files all reference the
+    branch via foreign keys without a DB-level cascade, so they're removed first
+    (by branch_id) before the branch row itself.
+    """
+    if current_user.role != UserRole.admin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only an administrator can delete a branch."
+        )
+    branch = db.get(Branch, branch_id)
+    if branch is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Branch not found")
+
+    db.execute(delete(MasterData).where(MasterData.branch_id == branch_id))
+    db.execute(delete(MasterRecord).where(MasterRecord.branch_id == branch_id))
+    db.execute(delete(ActivityLog).where(ActivityLog.branch_id == branch_id))
+    db.execute(delete(UploadedFile).where(UploadedFile.branch_id == branch_id))
+    db.delete(branch)
+    db.commit()

@@ -9,7 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
 
 from ..core.cleaning import (
+    FIELD_TYPES,
     FIX_LABELS,
+    NAME_SEP,
+    NAME_TYPES,
     TAG_LABELS,
     CleanRow,
     clean_dataset,
@@ -36,7 +39,11 @@ from ..schemas import (
     DataProfile,
     ReviewOut,
     RowEdit,
+    RowsAccept,
+    RowsBatchEdit,
     TagGroup,
+    UniqueValue,
+    UniqueValuesOut,
 )
 
 # The dataset heatmap ribbon is capped at this many pixels; larger files are
@@ -80,6 +87,23 @@ def _active_columns(f: UploadedFile) -> list[str]:
     return [m["master_column"] for m in f.mapping if m.get("input_header")]
 
 
+def _is_name_column(col: str) -> bool:
+    """Name fields (Singer, Composer, ...) hold pipe-separated people, so their
+    distinct/unique values are counted per individual name, not per whole cell."""
+    return FIELD_TYPES.get(col, "text") in NAME_TYPES
+
+
+def _value_pieces(col: str, value: str) -> list[str]:
+    """The distinct units of a cell: each piped name for name fields, else the
+    whole trimmed value. Empty cells contribute nothing."""
+    v = (value or "").strip()
+    if not v:
+        return []
+    if _is_name_column(col):
+        return [p.strip() for p in v.split(NAME_SEP) if p.strip()]
+    return [v]
+
+
 # --------------------------------------------------------------------------
 # In-memory cleaning
 #
@@ -99,7 +123,7 @@ _CACHE_LIMIT = 16
 def _signature(f: UploadedFile) -> str:
     # `data` is immutable after upload, so only the overlay + mapping vary.
     return json.dumps(
-        [f.mapping, f.corrections or {}, f.dropped or []],
+        [f.mapping, f.corrections or {}, f.dropped or [], f.accepted or []],
         sort_keys=True, default=str,
     )
 
@@ -114,6 +138,7 @@ def _entry(f: UploadedFile) -> dict:
     base = clean_dataset(f.data, f.headers, f.mapping)
     corrections = f.corrections or {}
     dropped = set(f.dropped or [])
+    accepted = set(f.accepted or [])
 
     rows: list[CleanRow] = []
     for r in base:
@@ -126,6 +151,13 @@ def _entry(f: UploadedFile) -> dict:
         rows.append(r)
 
     mark_duplicates(rows)
+
+    # "Keep as-is": clear error flags on accepted rows (values stay unchanged),
+    # so the reviewer's deliberate keep moves the row into the clean set.
+    if accepted:
+        for r in rows:
+            if r.index in accepted:
+                r.issues = [i for i in r.issues if i["action"] != "error"]
 
     if len(_CACHE) >= _CACHE_LIMIT:
         _CACHE.pop(next(iter(_CACHE)))
@@ -157,9 +189,64 @@ def _invalidate(file_id: int) -> None:
     _CACHE.pop(file_id, None)
 
 
+def _accept_in_place(f: UploadedFile) -> None:
+    """Apply the file's accepted-set to the cached rows WITHOUT re-cleaning.
+
+    Accepting a row only clears its error flags (the values are unchanged) — which
+    is exactly what `_entry` does for accepted rows. So instead of invalidating the
+    cache and re-cleaning every row (expensive on large files), we mutate the hot
+    cache in place: clear errors on the accepted rows, refresh the signature, and
+    drop the memoised summary/profile so they recompute cheaply (no cleaning) on
+    next access. Falls back to a normal lazy rebuild if the cache is cold."""
+    entry = _CACHE.get(f.id)
+    if not entry:
+        return
+    accepted = set(f.accepted or [])
+    for r in entry["rows"]:
+        if r.index in accepted:
+            r.issues = [i for i in r.issues if i["action"] != "error"]
+    entry["sig"] = _signature(f)
+    entry["summary"] = None
+    entry["profile"] = None
+
+
 def _row_out(r: CleanRow) -> CleanRowOut:
     return CleanRowOut(
         row_index=r.index, status=r.status, values=r.values, issues=r.issues
+    )
+
+
+def _review_payload(
+    f: UploadedFile,
+    view: str,
+    tag: str | None,
+    page: int,
+    page_size: int,
+    include_profile: bool,
+    tags: list[str] | None = None,
+    sort: str | None = None,
+    direction: str = "asc",
+    contains_col: str | None = None,
+    contains_val: str | None = None,
+) -> "ReviewOut":
+    """Build the full Review payload (summary + profile + page of rows). Shared by
+    GET /review and the edit/accept mutations so they each return in one trip.
+
+    Optional `tags` (match ANY), `contains_col`/`contains_val` (value filter) and
+    `sort`/`direction` are applied server-side so they hold across pages."""
+    rows = build_rows(f)
+    filtered = _filter_rows(rows, view, tag, tags, contains_col, contains_val)
+    filtered = _sort_rows(filtered, sort, direction)
+    total = len(filtered)
+    page = max(0, page)
+    page_rows = filtered[page * page_size : page * page_size + page_size]
+    return ReviewOut(
+        summary=_get_summary(f),
+        profile=_get_profile(f) if include_profile else None,
+        rows=[_row_out(r) for r in page_rows],
+        total=total,
+        page=page,
+        page_size=page_size,
     )
 
 
@@ -214,6 +301,9 @@ def run_clean(
     # Cleaning is a pure function of the file's signature, so a warm cache is
     # reused (no forced re-clean). The signature changes if the mapping did.
     summary = _get_summary(f)
+    # Warm the quality profile too, while the "Run cleaning" progress bar is up,
+    # so landing on Review serves rows + summary + profile from a hot cache.
+    _get_profile(f)
     if f.status not in (FileStatus.cleaned, FileStatus.committed):
         f.status = FileStatus.cleaned
         db.commit()
@@ -240,6 +330,9 @@ def _build_profile(columns: list[str], rows: list[CleanRow]) -> DataProfile:
     normalized = {c: 0 for c in columns}
     errors = {c: 0 for c in columns}
     distinct: dict[str, set] = {c: set() for c in columns}
+    # Pipe-aware distinct: name fields count each individual name (Singer 1 |
+    # Singer 2 -> 2), so the per-column "unique" badge reflects real people.
+    distinct_split: dict[str, set] = {c: set() for c in columns}
     counters: dict[str, Counter] = {c: Counter() for c in columns}
 
     # Per-row worst status (0 ok, 1 fixed, 2 error) for the heatmap ribbon.
@@ -260,6 +353,7 @@ def _build_profile(columns: list[str], rows: list[CleanRow]) -> DataProfile:
                 filled[c] += 1
                 distinct[c].add(v)
                 counters[c][v] += 1
+                distinct_split[c].update(_value_pieces(c, v))
         for issue in r.issues:
             col = issue.get("column")
             if col not in filled:
@@ -310,6 +404,7 @@ def _build_profile(columns: list[str], rows: list[CleanRow]) -> DataProfile:
             filled=filled[c],
             blank=total_rows - filled[c],
             distinct=len(distinct[c]),
+            unique=len(distinct_split[c]),
             fixed=fixed[c],
             normalized=normalized[c],
             errors=errors[c],
@@ -337,13 +432,46 @@ def _build_profile(columns: list[str], rows: list[CleanRow]) -> DataProfile:
 
 
 def _filter_rows(
-    rows: list[CleanRow], view: str | None, tag: str | None
+    rows: list[CleanRow],
+    view: str | None,
+    tag: str | None,
+    tags: list[str] | None = None,
+    contains_col: str | None = None,
+    contains_val: str | None = None,
 ) -> list[CleanRow]:
     if view in ("clean", "error"):
         rows = [r for r in rows if r.status == view]
     if tag:
         rows = [r for r in rows if any(i.get("tag") == tag for i in r.issues)]
+    if tags:
+        wanted = set(tags)
+        rows = [r for r in rows if any(i.get("tag") in wanted for i in r.issues)]
+    if contains_col and contains_val:
+        target = contains_val.strip().lower()
+        rows = [
+            r for r in rows
+            if any(p.lower() == target for p in _value_pieces(contains_col, r.values.get(contains_col, "")))
+            or target in (r.values.get(contains_col, "") or "").lower()
+        ]
     return rows
+
+
+def _sort_rows(rows: list[CleanRow], col: str | None, direction: str) -> list[CleanRow]:
+    """Stable, case-insensitive sort by one column's value. No-op if no column."""
+    if not col:
+        return rows
+    return sorted(
+        rows,
+        key=lambda r: (r.values.get(col, "") or "").strip().lower(),
+        reverse=(direction == "desc"),
+    )
+
+
+def _split_csv(value: str | None) -> list[str]:
+    """Split a comma-joined query param into a clean list (drops blanks)."""
+    if not value:
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
 
 
 @router.get("/api/files/{file_id}/clean/profile", response_model=DataProfile)
@@ -361,6 +489,11 @@ def review(
     file_id: int,
     view: str = "all",
     tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    contains_col: str | None = None,
+    contains_val: str | None = None,
     page: int = 0,
     page_size: int = 50,
     include_profile: bool = True,
@@ -370,24 +503,18 @@ def review(
     """Everything the Review screen needs in ONE request: summary, quality
     profile, and the requested page of rows (filtered by view/tag).
 
+    `tags` is a comma-joined list of cleaning/error tags (match ANY);
+    `contains_col`/`contains_val` filter by a column value; `sort`/`dir` order
+    the rows. All apply server-side so they hold across pages.
+
     Cleaning is computed once and memoised, so this is a single fast call no
     matter how the user pages or filters — and the big row blob is read at most
     once (on the first cache miss), never on a warm page."""
     f = _get_file_or_404(file_id, user, db)
-    rows = build_rows(f)
-
-    filtered = _filter_rows(rows, view, tag)
-    total = len(filtered)
-    page = max(0, page)
-    page_rows = filtered[page * page_size : page * page_size + page_size]
-
-    return ReviewOut(
-        summary=_get_summary(f),
-        profile=_get_profile(f) if include_profile else None,
-        rows=[_row_out(r) for r in page_rows],
-        total=total,
-        page=page,
-        page_size=page_size,
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        contains_col=contains_col, contains_val=contains_val,
     )
 
 
@@ -409,6 +536,33 @@ def clean_rows(
     f = _get_file_or_404(file_id, user, db)
     rows = _filter_rows(build_rows(f), status_filter, tag)
     return [_row_out(r) for r in rows[offset : offset + limit]]
+
+
+_UNIQUE_CAP = 1000  # bound the side-panel payload for very high-cardinality columns
+
+
+@router.get("/api/files/{file_id}/columns/{column}/unique", response_model=UniqueValuesOut)
+def column_unique_values(
+    file_id: int,
+    column: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """The distinct values of one column (most-common first), pipe-split for name
+    fields so each individual singer/composer is counted separately. Powers the
+    per-column "Show unique values" side panel. Runs over the cached rows."""
+    f = _get_file_or_404(file_id, user, db)
+    if column not in _active_columns(f):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Column not found")
+    counts: Counter = Counter()
+    for r in build_rows(f):
+        for piece in _value_pieces(column, r.values.get(column, "")):
+            counts[piece] += 1
+    return UniqueValuesOut(
+        column=column,
+        total_distinct=len(counts),
+        values=[UniqueValue(value=v, count=n) for v, n in counts.most_common(_UNIQUE_CAP)],
+    )
 
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -481,6 +635,92 @@ def edit_row(
         if r.index == row_index:
             return _row_out(r)
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Row not found")
+
+
+@router.put("/api/files/{file_id}/rows", response_model=ReviewOut)
+def edit_rows(
+    file_id: int,
+    payload: RowsBatchEdit,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    contains_col: str | None = None,
+    contains_val: str | None = None,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Apply many inline edits in one request and return the refreshed Review
+    payload — so the grid updates in a single round-trip (no extra reload).
+
+    Each edit is stored as a correction; rows that become fully clean afterwards
+    drop out of the review queue automatically.
+    """
+    f = _get_file_or_404(file_id, user, db)
+    corrections = dict(f.corrections or {})
+    n = len(f.data)
+    for idx_str, values in payload.edits.items():
+        try:
+            idx = int(idx_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < n):
+            continue
+        existing = dict(corrections.get(idx_str, {}))
+        existing.update(values)
+        corrections[idx_str] = existing
+    f.corrections = corrections
+    db.commit()
+    _invalidate(file_id)
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        contains_col=contains_col, contains_val=contains_val,
+    )
+
+
+@router.post("/api/files/{file_id}/accept", response_model=ReviewOut)
+def accept_rows(
+    file_id: int,
+    payload: RowsAccept,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    contains_col: str | None = None,
+    contains_val: str | None = None,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Keep flagged rows as-is: clear their error flags without changing values.
+
+    `rows` is empty + `tag` given -> accept every row carrying that error type."""
+    f = _get_file_or_404(file_id, user, db)
+    accepted = set(f.accepted or [])
+    if payload.rows:
+        accepted.update(i for i in payload.rows if 0 <= i < len(f.data))
+    elif tag:
+        accepted.update(
+            r.index for r in build_rows(f)
+            if any(i.get("tag") == tag for i in r.issues)
+        )
+    f.accepted = sorted(accepted)
+    db.commit()
+    # Fast path: update the cached rows in place instead of a full re-clean.
+    _accept_in_place(f)
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        contains_col=contains_col, contains_val=contains_val,
+    )
 
 
 @router.post("/api/files/{file_id}/clean/bulk", response_model=CleanSummary)

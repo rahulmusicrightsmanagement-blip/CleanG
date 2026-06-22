@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, download } from "../api/client.js";
 import Icon from "./Icon.jsx";
-import QualityCockpit from "./QualityCockpit.jsx";
 
 const PAGE_SIZE = 50;
 
@@ -42,7 +41,6 @@ export default function ReviewStep({ file, onCommitted }) {
   const [profile, setProfile] = useState(null);
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
-  const [showCockpit, setShowCockpit] = useState(false);
   const [view, setView] = useState("all"); // all | error | clean
   const [activeTag, setActiveTag] = useState(null);
   const [page, setPage] = useState(0);
@@ -55,6 +53,43 @@ export default function ReviewStep({ file, onCommitted }) {
   const [saving, setSaving] = useState(false);
   const [progress, setProgress] = useState(0);
   const [exporting, setExporting] = useState(false);
+  const [selected, setSelected] = useState(() => new Set()); // chosen row_index
+  const [selectAllPages, setSelectAllPages] = useState(false); // all across pages
+
+  // --- Filters: cleaning categories (match ANY) + sort + a column-value filter ---
+  const [showFilters, setShowFilters] = useState(false);
+  const [activeTags, setActiveTags] = useState([]); // applied fix-tag filters
+  const [sortCol, setSortCol] = useState("");
+  const [sortDir, setSortDir] = useState("asc");
+  const [containsCol, setContainsCol] = useState(""); // "show unique" value filter
+  const [containsVal, setContainsVal] = useState("");
+  // Draft selections inside the open filter modal (committed on "Apply filter").
+  const [draftTags, setDraftTags] = useState([]);
+  const [draftSortCol, setDraftSortCol] = useState("");
+  const [draftSortDir, setDraftSortDir] = useState("asc");
+
+  // --- Column header interactions ---
+  const [headerMenuCol, setHeaderMenuCol] = useState(null); // open popover column
+  const [headerMenuPos, setHeaderMenuPos] = useState(null); // {top,left} for the fixed menu
+  const [editCol, setEditCol] = useState(null); // column being edited inline
+  const [editConfirmed, setEditConfirmed] = useState(false);
+  const [pendingRows, setPendingRows] = useState(() => new Set()); // rows mid-accept
+
+  // --- Unique-values side panel ---
+  const [uniqueCol, setUniqueCol] = useState(null);
+  const [uniqueValues, setUniqueValues] = useState([]);
+  const [uniqueLoading, setUniqueLoading] = useState(false);
+  const [uniqueSearch, setUniqueSearch] = useState("");
+  const [uniqueSortKey, setUniqueSortKey] = useState("count"); // count | value
+  const [uniqueSortDir, setUniqueSortDir] = useState("desc"); // asc | desc
+
+  // --- Synced horizontal scrollbar shown above the grid ---
+  const gridScrollRef = useRef(null);
+  const topScrollRef = useRef(null);
+  const [gridWidth, setGridWidth] = useState(0);
+
+  // --- Save confirmation ---
+  const [showSaveConfirm, setShowSaveConfirm] = useState(false);
 
   // Headers come straight from the mapping we already have, so the grid frame
   // renders instantly instead of waiting on the network.
@@ -94,46 +129,160 @@ export default function ReviewStep({ file, onCommitted }) {
 
   const focusSet = useMemo(() => new Set(focusCols), [focusCols]);
 
+  // Per-column unique-value counts (pipe-aware for name fields) from the profile,
+  // shown as a badge in each column header.
+  const uniqueByCol = useMemo(() => {
+    const m = {};
+    (profile?.columns || []).forEach((p) => {
+      m[p.name] = p.unique;
+    });
+    return m;
+  }, [profile]);
+
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  // Shared query string so GET /review and the edit/accept mutations all target
+  // the same view/tag/page — letting mutations return the refreshed grid in one
+  // round-trip instead of a second reload.
+  const buildQs = useCallback(
+    (withProfile) => {
+      const qs = new URLSearchParams({
+        view,
+        page: String(page),
+        page_size: String(PAGE_SIZE),
+        include_profile: String(withProfile),
+      });
+      if (activeTag) qs.set("tag", activeTag);
+      if (activeTags.length) qs.set("tags", activeTags.join(","));
+      if (sortCol) {
+        qs.set("sort", sortCol);
+        qs.set("dir", sortDir);
+      }
+      if (containsCol && containsVal) {
+        qs.set("contains_col", containsCol);
+        qs.set("contains_val", containsVal);
+      }
+      return qs.toString();
+    },
+    [view, page, activeTag, activeTags, sortCol, sortDir, containsCol, containsVal]
+  );
+
+  const applyPayload = useCallback((d) => {
+    setSummary(d.summary);
+    if (d.profile) setProfile(d.profile);
+    setRows(d.rows);
+    setTotal(d.total);
+  }, []);
 
   // ONE request gives us summary + quality profile + the current page of rows.
   const load = useCallback(
     async (withProfile) => {
       setLoading(true);
       try {
-        const qs = new URLSearchParams({
-          view,
-          page: String(page),
-          page_size: String(PAGE_SIZE),
-          include_profile: String(withProfile),
-        });
-        // Filter by the selected tag in any view (error tag or cleaning tag).
-        if (activeTag) qs.set("tag", activeTag);
-        const d = await api(`/api/files/${file.id}/review?${qs.toString()}`);
-        setSummary(d.summary);
-        if (d.profile) setProfile(d.profile);
-        setRows(d.rows);
-        setTotal(d.total);
+        applyPayload(await api(`/api/files/${file.id}/review?${buildQs(withProfile)}`));
       } catch (e) {
         setError(e.message);
       } finally {
         setLoading(false);
       }
     },
-    [file.id, view, activeTag, page]
+    [file.id, buildQs, applyPayload]
   );
 
-  // Profile only changes when the data does (edits/bulk), not when paging —
-  // so we fetch it on first load and refresh it after a mutation.
+  // Grid rows/summary load on every page/view/tag/filter change. The quality
+  // profile is fetched separately (below) so the grid paints without waiting on
+  // the heavier profile pass — a noticeable first-load speed-up.
   useEffect(() => {
-    load(!profile);
+    load(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load]);
+
+  // Profile only changes when the data does, so fetch it once on mount (its own
+  // request, off the critical path). Mutations refresh it via their payload.
+  const loadProfile = useCallback(async () => {
+    try {
+      setProfile(await api(`/api/files/${file.id}/clean/profile`));
+    } catch {
+      /* non-fatal: the grid works without the profile */
+    }
+  }, [file.id]);
+
+  useEffect(() => {
+    loadProfile();
+  }, [loadProfile]);
+
+  // Keep the top scrollbar's width in sync with the grid's full content width so
+  // the user can scroll horizontally from the top without reaching the bottom.
+  useEffect(() => {
+    const measure = () => {
+      if (gridScrollRef.current) setGridWidth(gridScrollRef.current.scrollWidth);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [rows, displayColumns, loading]);
+
+  function syncFromGrid() {
+    if (topScrollRef.current && gridScrollRef.current)
+      topScrollRef.current.scrollLeft = gridScrollRef.current.scrollLeft;
+  }
+  function syncFromTop() {
+    if (topScrollRef.current && gridScrollRef.current)
+      gridScrollRef.current.scrollLeft = topScrollRef.current.scrollLeft;
+  }
+
+  // Close an open column-header menu when clicking anywhere outside a header.
+  // (A document listener, not a backdrop, so the sticky-header stacking context
+  // can't hide the menu beneath it.)
+  useEffect(() => {
+    if (!headerMenuCol) return;
+    const onDoc = (e) => {
+      if (!e.target.closest(".th-inner") && !e.target.closest(".th-menu")) {
+        setHeaderMenuCol(null);
+      }
+    };
+    const close = () => setHeaderMenuCol(null);
+    document.addEventListener("mousedown", onDoc);
+    // The menu is fixed-positioned, so any scroll would detach it — just close.
+    window.addEventListener("scroll", close, true);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [headerMenuCol]);
 
   function switchView(v, tag = null) {
     setView(v);
     setActiveTag(tag);
     setPage(0);
+    clearSelection();
+  }
+
+  function clearSelection() {
+    setSelected(new Set());
+    setSelectAllPages(false);
+  }
+
+  function toggleRow(idx) {
+    setSelectAllPages(false);
+    setSelected((s) => {
+      const n = new Set(s);
+      n.has(idx) ? n.delete(idx) : n.add(idx);
+      return n;
+    });
+  }
+
+  // Header checkbox: select / clear every row on the current page.
+  function togglePage() {
+    const pageIdx = rows.map((r) => r.row_index);
+    const allOn = pageIdx.length > 0 && pageIdx.every((i) => selected.has(i));
+    setSelectAllPages(false);
+    setSelected((s) => {
+      const n = new Set(s);
+      if (allOn) pageIdx.forEach((i) => n.delete(i));
+      else pageIdx.forEach((i) => n.add(i));
+      return n;
+    });
   }
 
   function errorMap(row) {
@@ -164,10 +313,18 @@ export default function ReviewStep({ file, onCommitted }) {
     setDrafts((d) => ({ ...d, [rowIndex]: { ...d[rowIndex], [col]: value } }));
   }
 
+  function markPending(idx, on) {
+    setPendingRows((s) => {
+      const n = new Set(s);
+      on ? n.add(idx) : n.delete(idx);
+      return n;
+    });
+  }
+
   async function saveRow(row) {
     const values = drafts[row.row_index];
     if (!values) return;
-    setBusy(true);
+    markPending(row.row_index, true);
     setError("");
     try {
       await api(`/api/files/${file.id}/rows/${row.row_index}`, {
@@ -183,8 +340,180 @@ export default function ReviewStep({ file, onCommitted }) {
     } catch (err) {
       setError(err.message);
     } finally {
+      markPending(row.row_index, false);
+    }
+  }
+
+  // Keep one flagged row as-is, with a spinner on that row so the move to the
+  // clean set is visibly acknowledged immediately.
+  async function keepRow(idx) {
+    markPending(idx, true);
+    try {
+      await acceptRows([idx]);
+    } finally {
+      markPending(idx, false);
+    }
+  }
+
+  // Apply ALL pending inline edits in ONE round-trip (the PUT returns the
+  // refreshed grid). Rows that become fully clean drop out of review.
+  async function applyAllDrafts() {
+    if (Object.keys(drafts).length === 0) return;
+    setBusy(true);
+    setError("");
+    try {
+      const d = await api(`/api/files/${file.id}/rows?${buildQs(true)}`, {
+        method: "PUT",
+        body: { edits: drafts },
+      });
+      setDrafts({});
+      applyPayload(d);
+    } catch (err) {
+      setError(err.message);
+    } finally {
       setBusy(false);
     }
+  }
+
+  function discardDrafts() {
+    setDrafts({});
+  }
+
+  // --- Filters ---------------------------------------------------------------
+  function openFilters() {
+    // Seed the modal with whatever's currently applied so it reflects reality.
+    setDraftTags(activeTags);
+    setDraftSortCol(sortCol);
+    setDraftSortDir(sortDir);
+    setShowFilters(true);
+  }
+
+  function toggleDraftTag(tag) {
+    setDraftTags((t) =>
+      t.includes(tag) ? t.filter((x) => x !== tag) : [...t, tag]
+    );
+  }
+
+  function applyFilters() {
+    setActiveTags(draftTags);
+    setSortCol(draftSortCol);
+    setSortDir(draftSortDir);
+    setPage(0);
+    setShowFilters(false);
+  }
+
+  function clearFilters() {
+    setActiveTags([]);
+    setSortCol("");
+    setSortDir("asc");
+    setDraftTags([]);
+    setDraftSortCol("");
+    setDraftSortDir("asc");
+    setPage(0);
+  }
+
+  function removeTagFilter(tag) {
+    setActiveTags((t) => t.filter((x) => x !== tag));
+    setPage(0);
+  }
+
+  // --- Column header menu / editing / unique values --------------------------
+  // The grid scrolls with overflow:hidden cells, so an in-flow dropdown would be
+  // clipped. Instead we anchor a fixed-position menu to the clicked header.
+  function toggleHeaderMenu(col, e) {
+    if (headerMenuCol === col) {
+      setHeaderMenuCol(null);
+      return;
+    }
+    const r = e.currentTarget.getBoundingClientRect();
+    setHeaderMenuPos({ top: r.bottom + 4, left: r.left });
+    setHeaderMenuCol(col);
+  }
+
+  function startEditCol(col) {
+    setHeaderMenuCol(null);
+    setEditCol(col);
+    setEditConfirmed(false);
+  }
+
+  function cancelEditCol() {
+    setEditCol(null);
+    setEditConfirmed(false);
+    discardDrafts();
+  }
+
+  async function saveColumnEdits() {
+    await applyAllDrafts();
+    setEditCol(null);
+    setEditConfirmed(false);
+  }
+
+  async function openUnique(col) {
+    setHeaderMenuCol(null);
+    setUniqueCol(col);
+    setUniqueSearch("");
+    setUniqueValues([]);
+    setUniqueLoading(true);
+    try {
+      const d = await api(
+        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/unique`
+      );
+      setUniqueValues(d.values || []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setUniqueLoading(false);
+    }
+  }
+
+  function pickUnique(value) {
+    setContainsCol(uniqueCol);
+    setContainsVal(value);
+    setPage(0);
+  }
+
+  function clearContains() {
+    setContainsCol("");
+    setContainsVal("");
+    setPage(0);
+  }
+
+  // Unique-panel sort: clicking the active key flips its direction; clicking the
+  // other key switches to it with a sensible default (count→high first, value→A–Z).
+  function pickUniqueSort(key) {
+    if (uniqueSortKey === key) {
+      setUniqueSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setUniqueSortKey(key);
+      setUniqueSortDir(key === "count" ? "desc" : "asc");
+    }
+  }
+
+  // "Keep as-is": accept rows without changing their values — clears the flags
+  // and moves them to clean. `rows: []` + an active tag accepts the whole group;
+  // `selectAll` accepts every flagged row in the current view/tag filter.
+  async function acceptRows(rowIndexes, selectAll = false) {
+    setBusy(true);
+    setError("");
+    try {
+      const qs = buildQs(true) + (selectAll ? "&select_all=true" : "");
+      const d = await api(`/api/files/${file.id}/accept?${qs}`, {
+        method: "POST",
+        body: { rows: rowIndexes },
+      });
+      applyPayload(d);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Keep every selected row as-is (or all flagged rows when "select all pages").
+  async function keepSelected() {
+    if (selectAllPages) await acceptRows([], true);
+    else if (selected.size > 0) await acceptRows([...selected]);
+    clearSelection();
   }
 
   async function runBulk(action) {
@@ -290,6 +619,20 @@ export default function ReviewStep({ file, onCommitted }) {
   }
 
   const errorsLeft = summary?.errors ?? 0;
+  const editedRows = Object.keys(drafts).length;
+  const editedCells = Object.values(drafts).reduce(
+    (n, o) => n + Object.keys(o).length,
+    0
+  );
+
+  // Selection state for "select all → keep all at once".
+  const pageAllSelected =
+    selectAllPages ||
+    (rows.length > 0 && rows.every((r) => selected.has(r.row_index)));
+  const selectedCount = selectAllPages ? total : selected.size;
+  // Offer "all across pages" once the whole page is ticked and more pages exist.
+  const canSelectAllPages =
+    !selectAllPages && pageAllSelected && total > rows.length;
 
   return (
     <div className="theme-light review-page">
@@ -320,7 +663,7 @@ export default function ReviewStep({ file, onCommitted }) {
         </div>
         <button
           className="btn primary"
-          onClick={commit}
+          onClick={() => setShowSaveConfirm(true)}
           disabled={busy || !summary || summary.clean === 0}
         >
           <Icon name="check" size={16} />
@@ -367,33 +710,25 @@ export default function ReviewStep({ file, onCommitted }) {
         </div>
       </div>
 
-      {/* Quality cockpit (collapsible) */}
-      {profile && (
-        <div className="cockpit-shell">
-          <button className="cockpit-toggle" onClick={() => setShowCockpit((s) => !s)}>
-            <Icon name="sparkles" size={15} />
-            Data quality cockpit
-            <span className="muted small">
-              score {profile.score} · grade {profile.grade}
-            </span>
-            <span className="cockpit-caret">{showCockpit ? "▾" : "▸"}</span>
+      {/* View tabs + Filters (on the right) */}
+      <div className="view-bar">
+        <div className="view-tabs">
+          <button className={view === "all" ? "active" : ""} onClick={() => switchView("all")}>
+            All rows
           </button>
-          {showCockpit && (
-            <QualityCockpit profile={profile} onPickColumn={() => switchView("error", null)} />
-          )}
+          <button className={view === "error" ? "active" : ""} onClick={() => switchView("error")}>
+            Needs review ({errorsLeft})
+          </button>
+          <button className={view === "clean" ? "active" : ""} onClick={() => switchView("clean")}>
+            Clean ({summary?.clean ?? 0})
+          </button>
         </div>
-      )}
-
-      {/* View tabs */}
-      <div className="view-tabs">
-        <button className={view === "all" ? "active" : ""} onClick={() => switchView("all")}>
-          All rows
-        </button>
-        <button className={view === "error" ? "active" : ""} onClick={() => switchView("error")}>
-          Needs review ({errorsLeft})
-        </button>
-        <button className={view === "clean" ? "active" : ""} onClick={() => switchView("clean")}>
-          Clean ({summary?.clean ?? 0})
+        <button className="btn sm filter-btn" onClick={openFilters}>
+          <Icon name="filter" size={14} />
+          Filters
+          {(activeTags.length > 0 || sortCol) && (
+            <span className="filter-n">{activeTags.length + (sortCol ? 1 : 0)}</span>
+          )}
         </button>
       </div>
 
@@ -461,6 +796,14 @@ export default function ReviewStep({ file, onCommitted }) {
                   </button>
                 </>
               )}
+              <button
+                className="btn sm"
+                disabled={busy}
+                onClick={() => acceptRows([])}
+                title="Keep all these rows as-is and mark them reviewed"
+              >
+                Keep all as-is
+              </button>
               <button className="btn sm" disabled={busy} onClick={() => runBulk("drop")}>
                 Drop all
               </button>
@@ -469,40 +812,47 @@ export default function ReviewStep({ file, onCommitted }) {
         </>
       )}
 
-      {/* What the tool cleaned (accuracy breakdown). Shown in "All rows" and
-          "Clean"; pick one to highlight those cells. Note: some fixes (e.g. junk
-          cleared from a required field) leave the row needing review, so they only
-          appear under "All rows". */}
-      {(view === "all" || view === "clean") &&
-        summary &&
-        summary.fix_tags?.length > 0 && (
-          <>
-            <div className="breakdown-label muted small">
-              <Icon name="sparkles" size={13} /> What the tool cleaned — pick one to highlight it
-            </div>
-            <div className="tag-filter">
-              <button
-                className={`tag-chip ${!activeTag ? "active" : ""}`}
-                onClick={() => switchView(view, null)}
-              >
-                {view === "clean" ? "All clean" : "All rows"}{" "}
-                <span className="n">{view === "clean" ? summary.clean : summary.total}</span>
-              </button>
-              {summary.fix_tags.map((t) => (
-                <button
-                  key={t.tag}
-                  className={`tag-chip ${activeTag === t.tag ? "active" : ""}`}
-                  style={{ "--tag": tagColor(t.tag) }}
-                  onClick={() => switchView(view, t.tag)}
-                  title={`${t.count} cell${t.count === 1 ? "" : "s"} cleaned across the dataset`}
-                >
-                  <span className="tag-dot" />
-                  {t.label} <span className="n">{t.count}</span>
+      {/* Active-filter chips — what's currently applied via the Filters popup */}
+      {(activeTags.length > 0 || sortCol || containsCol) && (
+        <div className="review-toolbar">
+          <div className="active-filters">
+            {activeTags.map((t) => (
+              <span className="filter-chip" key={t}>
+                {tagLabel[t] || t}
+                <button onClick={() => removeTagFilter(t)} title="Remove filter">
+                  <Icon name="x" size={11} />
                 </button>
-              ))}
-            </div>
-          </>
-        )}
+              </span>
+            ))}
+            {sortCol && (
+              <span className="filter-chip">
+                <Icon name="sort" size={12} />
+                {sortCol} · {sortDir === "asc" ? "Ascending" : "Descending"}
+                <button
+                  onClick={() => {
+                    setSortCol("");
+                    setPage(0);
+                  }}
+                  title="Remove sort"
+                >
+                  <Icon name="x" size={11} />
+                </button>
+              </span>
+            )}
+            {containsCol && (
+              <span className="filter-chip alt">
+                {containsCol}: “{containsVal}”
+                <button onClick={clearContains} title="Clear value filter">
+                  <Icon name="x" size={11} />
+                </button>
+              </span>
+            )}
+            <button className="link-btn" onClick={() => { clearFilters(); clearContains(); }}>
+              Clear all
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Legend — what the cell colours mean */}
       <div className="grid-legend">
@@ -512,20 +862,55 @@ export default function ReviewStep({ file, onCommitted }) {
         <span className="muted small lg-hint">Hover a cell to see the original value · click a flagged cell to edit</span>
       </div>
 
+      {/* Top horizontal scrollbar, synced with the grid — scroll across columns
+          without having to reach the bottom of the table first. */}
+      <div className="grid-xscroll" ref={topScrollRef} onScroll={syncFromTop}>
+        <div style={{ width: gridWidth, height: 1 }} />
+      </div>
+
       {/* Data grid */}
-      <div className="grid-scroll">
+      <div className="grid-scroll" ref={gridScrollRef} onScroll={syncFromGrid}>
         <table className="grid-table">
           <thead>
             <tr>
-              <th className="rownum">#</th>
+              <th className="rownum">
+                <input
+                  type="checkbox"
+                  className="row-check"
+                  checked={pageAllSelected}
+                  onChange={togglePage}
+                  title="Select all rows on this page"
+                />
+              </th>
               {displayColumns.map((c) => (
                 <th
                   key={c}
-                  className={focusSet.has(c) ? "col-focus" : ""}
+                  className={`${focusSet.has(c) ? "col-focus" : ""}${
+                    editCol === c ? " col-editing" : ""
+                  }`}
                   style={focusSet.has(c) ? { "--tag": tagColor(activeTag) } : undefined}
                 >
-                  {focusSet.has(c) && <span className="col-focus-dot" />}
-                  {c}
+                  <div className="th-inner">
+                    <button
+                      className="th-label"
+                      onClick={(e) => toggleHeaderMenu(c, e)}
+                      title="Column options"
+                    >
+                      {focusSet.has(c) && <span className="col-focus-dot" />}
+                      <span className="th-name">{c}</span>
+                      {uniqueByCol[c] != null && (
+                        <span
+                          className="th-unique"
+                          title={`${uniqueByCol[c]} unique value${
+                            uniqueByCol[c] === 1 ? "" : "s"
+                          }`}
+                        >
+                          {uniqueByCol[c]}
+                        </span>
+                      )}
+                      <span className="th-caret">▾</span>
+                    </button>
+                  </div>
                 </th>
               ))}
             </tr>
@@ -549,22 +934,57 @@ export default function ReviewStep({ file, onCommitted }) {
                   const fixes = fixedMap(row);
                   const hasDraft = !!drafts[row.row_index];
                   return (
-                    <tr key={row.row_index} className={row.status === "error" ? "row-err" : ""}>
+                    <tr
+                      key={row.row_index}
+                      className={`${row.status === "error" ? "row-err" : ""}${
+                        selectAllPages || selected.has(row.row_index) ? " row-sel" : ""
+                      }`}
+                    >
                       <td className="rownum">
-                        {row.row_index + 1}
-                        {hasDraft && (
+                        <input
+                          type="checkbox"
+                          className="row-check"
+                          checked={selectAllPages || selected.has(row.row_index)}
+                          onChange={() => toggleRow(row.row_index)}
+                        />
+                        <span className="rownum-n">{row.row_index + 1}</span>
+                        {pendingRows.has(row.row_index) ? (
+                          <span className="row-spin" title="Saving…" />
+                        ) : hasDraft ? (
                           <button
                             className="cell-save"
-                            title="Save row"
+                            title="Apply this row's edits"
                             onClick={() => saveRow(row)}
                           >
                             <Icon name="check" size={12} />
                           </button>
-                        )}
+                        ) : row.status === "error" ? (
+                          <button
+                            className="cell-keep"
+                            title="Keep this row as-is (mark reviewed)"
+                            onClick={() => keepRow(row.row_index)}
+                          >
+                            <Icon name="check" size={12} />
+                          </button>
+                        ) : null}
                       </td>
                       {displayColumns.map((c) => {
                         const issue = errs[c];
                         const val = drafts[row.row_index]?.[c] ?? row.values[c] ?? "";
+                        // Whole-column edit mode: every cell of this column on the
+                        // page becomes a plain editable input (page-only scope).
+                        if (editCol === c) {
+                          return (
+                            <td key={c} className="cell-edit">
+                              <input
+                                value={val}
+                                onChange={(e) =>
+                                  setDraft(row.row_index, c, e.target.value)
+                                }
+                              />
+                            </td>
+                          );
+                        }
                         if (issue) {
                           return (
                             <td
@@ -576,9 +996,6 @@ export default function ReviewStep({ file, onCommitted }) {
                               <input
                                 value={val}
                                 onChange={(e) => setDraft(row.row_index, c, e.target.value)}
-                                onBlur={() =>
-                                  drafts[row.row_index]?.[c] !== undefined && saveRow(row)
-                                }
                               />
                               <span className="cell-tag">
                                 {tagLabel[issue.tag] || issue.tag}
@@ -647,6 +1064,95 @@ export default function ReviewStep({ file, onCommitted }) {
         </table>
       </div>
 
+      {/* Sticky selection bar — keep many rows as-is in one go */}
+      {selectedCount > 0 && editedRows === 0 && !saving && (
+        <div className="edits-bar select-bar">
+          <div className="edits-bar-info">
+            <span className="edits-bar-dot sel">
+              <Icon name="check" size={15} />
+            </span>
+            <span>
+              <strong>{selectedCount}</strong> row{selectedCount !== 1 ? "s" : ""} selected
+              {selectAllPages && " (all pages)"}
+              {canSelectAllPages && (
+                <button className="link-btn" onClick={() => setSelectAllPages(true)}>
+                  Select all {total}
+                </button>
+              )}
+            </span>
+          </div>
+          <div className="edits-bar-actions">
+            <button className="btn sm" onClick={clearSelection} disabled={busy}>
+              Clear
+            </button>
+            <button className="btn primary sm" onClick={keepSelected} disabled={busy}>
+              <Icon name="check" size={15} />
+              {busy ? "Keeping…" : "Keep selected as-is"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Column-edit bar — confirm + save the whole-column edits on this page */}
+      {editCol && !saving && (
+        <div className="edits-bar col-edit-bar">
+          <div className="edits-bar-info">
+            <span className="edits-bar-dot">
+              <Icon name="edit" size={15} />
+            </span>
+            <span>
+              Editing <strong>{editCol}</strong> on this page —{" "}
+              <strong>{editedCells}</strong> change{editedCells !== 1 ? "s" : ""}
+            </span>
+          </div>
+          <div className="edits-bar-actions">
+            <label className="confirm-check">
+              <input
+                type="checkbox"
+                checked={editConfirmed}
+                onChange={(e) => setEditConfirmed(e.target.checked)}
+              />
+              Confirm edits
+            </label>
+            <button className="btn sm" onClick={cancelEditCol} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              className="btn primary sm"
+              onClick={saveColumnEdits}
+              disabled={busy || !editConfirmed || editedCells === 0}
+            >
+              <Icon name="check" size={15} />
+              {busy ? "Saving…" : "Save column changes"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Sticky "you have unsaved edits" bar — explicit apply/discard, batch-wide */}
+      {editedRows > 0 && !editCol && !saving && (
+        <div className="edits-bar">
+          <div className="edits-bar-info">
+            <span className="edits-bar-dot">
+              <Icon name="check" size={15} />
+            </span>
+            <span>
+              <strong>{editedCells}</strong> edit{editedCells !== 1 ? "s" : ""} in{" "}
+              <strong>{editedRows}</strong> row{editedRows !== 1 ? "s" : ""} — not applied yet
+            </span>
+          </div>
+          <div className="edits-bar-actions">
+            <button className="btn sm" onClick={discardDrafts} disabled={busy}>
+              Discard
+            </button>
+            <button className="btn primary sm" onClick={applyAllDrafts} disabled={busy}>
+              <Icon name="check" size={15} />
+              {busy ? "Applying…" : "Apply edits & move clean rows out"}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Pagination */}
       {pages > 1 && (
         <div className="pager">
@@ -663,6 +1169,232 @@ export default function ReviewStep({ file, onCommitted }) {
           >
             Next →
           </button>
+        </div>
+      )}
+
+      {/* Column-header menu — fixed-positioned so the scroll container can't clip it */}
+      {headerMenuCol && headerMenuPos && (
+        <div
+          className="th-menu"
+          style={{ top: headerMenuPos.top, left: headerMenuPos.left }}
+        >
+          <button onClick={() => startEditCol(headerMenuCol)}>
+            <Icon name="edit" size={13} /> Edit column
+          </button>
+          <button onClick={() => openUnique(headerMenuCol)}>
+            <Icon name="table" size={13} /> Show unique values
+            {uniqueByCol[headerMenuCol] != null
+              ? ` (${uniqueByCol[headerMenuCol]})`
+              : ""}
+          </button>
+        </div>
+      )}
+
+      {/* Filter popup — cleaning categories (match ANY) + sort */}
+      {showFilters && (
+        <div className="save-overlay" onClick={() => setShowFilters(false)}>
+          <div className="filter-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="filter-modal-head">
+              <h3>
+                <Icon name="filter" size={16} /> Filters
+              </h3>
+              <button className="icon-btn" onClick={() => setShowFilters(false)}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">What the tool cleaned</label>
+              {(summary?.fix_tags || []).length === 0 ? (
+                <p className="muted small">No cleaning categories to filter by.</p>
+              ) : (
+                <div className="filter-checks">
+                  {summary.fix_tags.map((t) => (
+                    <label className="filter-check" key={t.tag}>
+                      <input
+                        type="checkbox"
+                        checked={draftTags.includes(t.tag)}
+                        onChange={() => toggleDraftTag(t.tag)}
+                      />
+                      <span className="tag-dot" style={{ "--tag": tagColor(t.tag) }} />
+                      {t.label}
+                      <span className="n">{t.count}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">Sort rows</label>
+              <div className="filter-sort">
+                <select value={draftSortDir} onChange={(e) => setDraftSortDir(e.target.value)}>
+                  <option value="asc">Ascending</option>
+                  <option value="desc">Descending</option>
+                </select>
+                <select value={draftSortCol} onChange={(e) => setDraftSortCol(e.target.value)}>
+                  <option value="">No sorting</option>
+                  {columns.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="filter-modal-actions">
+              <button className="btn sm" onClick={clearFilters}>
+                Clear
+              </button>
+              <button className="btn primary sm" onClick={applyFilters}>
+                Apply filter
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Save confirmation popup */}
+      {showSaveConfirm && (
+        <div className="save-overlay" onClick={() => setShowSaveConfirm(false)}>
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark">
+              <Icon name="check" size={22} />
+            </div>
+            <h3>Save to the master dataset?</h3>
+            <p className="muted">
+              This will save <strong>{summary?.clean ?? 0}</strong> clean row
+              {summary?.clean === 1 ? "" : "s"} to the master dataset. Rows that
+              still need review are skipped.
+            </p>
+            <div className="confirm-actions">
+              <button className="btn sm" onClick={() => setShowSaveConfirm(false)} disabled={busy}>
+                Cancel
+              </button>
+              <button
+                className="btn primary sm"
+                onClick={() => {
+                  setShowSaveConfirm(false);
+                  commit();
+                }}
+                disabled={busy}
+              >
+                <Icon name="check" size={15} />
+                Save {summary?.clean ?? 0} row{summary?.clean === 1 ? "" : "s"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Unique-values side panel — click a value to filter the grid by it */}
+      {uniqueCol && (
+        <div className="unique-overlay" onClick={() => setUniqueCol(null)}>
+          <aside className="unique-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="unique-head">
+              <div>
+                <h3>Unique values</h3>
+                <span className="muted small">{uniqueCol}</span>
+              </div>
+              <button className="icon-btn" onClick={() => setUniqueCol(null)}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+            <div className="unique-search">
+              <Icon name="search" size={14} />
+              <input
+                placeholder="Search values…"
+                value={uniqueSearch}
+                onChange={(e) => setUniqueSearch(e.target.value)}
+              />
+            </div>
+            <div className="unique-sortbar">
+              <span className="muted small">
+                {uniqueValues.length} value{uniqueValues.length === 1 ? "" : "s"}
+              </span>
+              <div className="unique-sort-opts">
+                <span className="muted small">Sort by</span>
+                <button
+                  className={`unique-sort ${uniqueSortKey === "count" ? "active" : ""}`}
+                  onClick={() => pickUniqueSort("count")}
+                  title="Sort by how many rows carry each value"
+                >
+                  <span className="sort-key-label">Count</span>
+                  {uniqueSortKey === "count" && (
+                    <span className="sort-arrow">{uniqueSortDir === "desc" ? "↓" : "↑"}</span>
+                  )}
+                </button>
+                <button
+                  className={`unique-sort ${uniqueSortKey === "value" ? "active" : ""}`}
+                  onClick={() => pickUniqueSort("value")}
+                  title={`Sort by ${uniqueCol} alphabetically`}
+                >
+                  <span className="sort-key-label">{uniqueCol}</span>
+                  {uniqueSortKey === "value" && (
+                    <span className="sort-arrow">{uniqueSortDir === "desc" ? "↓" : "↑"}</span>
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="unique-list">
+              {uniqueLoading ? (
+                <p className="muted small" style={{ padding: "0.75rem" }}>
+                  Loading…
+                </p>
+              ) : (
+                (() => {
+                  const q = uniqueSearch.trim().toLowerCase();
+                  const filtered = q
+                    ? uniqueValues.filter((u) => u.value.toLowerCase().includes(q))
+                    : uniqueValues;
+                  const shown = [...filtered].sort((a, b) => {
+                    if (uniqueSortKey === "value") {
+                      const cmp = a.value.localeCompare(b.value, undefined, {
+                        numeric: true,
+                        sensitivity: "base",
+                      });
+                      return uniqueSortDir === "desc" ? -cmp : cmp;
+                    }
+                    return uniqueSortDir === "desc"
+                      ? b.count - a.count
+                      : a.count - b.count;
+                  });
+                  if (shown.length === 0)
+                    return (
+                      <p className="muted small" style={{ padding: "0.75rem" }}>
+                        No matching values.
+                      </p>
+                    );
+                  return shown.map((u) => (
+                    <button
+                      className={`unique-row${
+                        containsCol === uniqueCol && containsVal === u.value
+                          ? " active"
+                          : ""
+                      }`}
+                      key={u.value}
+                      onClick={() => pickUnique(u.value)}
+                      title="Filter the grid to rows containing this value"
+                    >
+                      <span className="unique-val">{u.value}</span>
+                      <span className="unique-count">{u.count}</span>
+                    </button>
+                  ));
+                })()
+              )}
+            </div>
+            {containsCol === uniqueCol && containsVal && (
+              <div className="unique-foot">
+                <span className="muted small">
+                  Filtering by “{containsVal}”
+                </span>
+                <button className="link-btn" onClick={clearContains}>
+                  Clear
+                </button>
+              </div>
+            )}
+          </aside>
         </div>
       )}
     </div>
