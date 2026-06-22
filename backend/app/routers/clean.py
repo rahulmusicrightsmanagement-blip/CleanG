@@ -19,6 +19,7 @@ from ..core.cleaning import (
     mark_duplicates,
     revalidate,
 )
+from ..core.http import content_disposition
 from ..core.master_store import upsert_master_records
 from ..database import get_db
 from ..deps import get_current_user
@@ -606,7 +607,7 @@ def export_rows(
     return StreamingResponse(
         buf,
         media_type=_XLSX_MIME,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 

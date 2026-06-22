@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -21,20 +22,26 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(_encode(plain), hashed.encode("utf-8"))
 
 
-def create_access_token(subject: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.access_token_expire_minutes
-    )
-    payload = {"sub": subject, "exp": expire}
+def create_access_token(subject: str, token_version: int = 0) -> str:
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=settings.access_token_expire_minutes)
+    payload = {
+        "sub": subject,
+        "iat": now,
+        "exp": expire,
+        "jti": uuid.uuid4().hex,
+        # Bumping a user's token_version (logout / deactivate / password reset)
+        # invalidates every token minted before the bump.
+        "ver": token_version,
+    }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
-def decode_access_token(token: str) -> str | None:
-    """Return the subject (user id as string) or None if invalid/expired."""
+def decode_access_token(token: str) -> dict | None:
+    """Return the token payload, or None if invalid/expired."""
     try:
-        payload = jwt.decode(
+        return jwt.decode(
             token, settings.secret_key, algorithms=[settings.algorithm]
         )
-        return payload.get("sub")
     except JWTError:
         return None

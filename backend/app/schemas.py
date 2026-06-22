@@ -1,14 +1,38 @@
+import re
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from .models import BranchStatus, FileStatus, UserRole
+
+# Bounded free-text aliases — cap stored string lengths to prevent storage abuse.
+ShortText = Annotated[str, Field(min_length=1, max_length=255)]
+LongText = Annotated[str, Field(max_length=2000)]
+
+_PASSWORD_MIN = 12
+
+
+def validate_password_strength(value: str) -> str:
+    """Reject weak passwords: >=12 chars with upper, lower and digit."""
+    if len(value) < _PASSWORD_MIN:
+        raise ValueError(f"Password must be at least {_PASSWORD_MIN} characters long.")
+    if len(value) > 128:
+        raise ValueError("Password must be at most 128 characters long.")
+    if not re.search(r"[a-z]", value):
+        raise ValueError("Password must contain a lowercase letter.")
+    if not re.search(r"[A-Z]", value):
+        raise ValueError("Password must contain an uppercase letter.")
+    if not re.search(r"\d", value):
+        raise ValueError("Password must contain a digit.")
+    return value
 
 
 # ---- Auth ----
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    # Bounded but NOT strength-checked: existing accounts must still log in.
+    password: Annotated[str, Field(min_length=1, max_length=128)]
 
 
 class Token(BaseModel):
@@ -19,9 +43,24 @@ class Token(BaseModel):
 # ---- Users ----
 class UserCreate(BaseModel):
     email: EmailStr
-    full_name: str
+    full_name: ShortText
     password: str
     role: UserRole = UserRole.user
+
+    _check_password = field_validator("password")(validate_password_strength)
+
+
+class UserUpdate(BaseModel):
+    """Admin edit: role and/or active state."""
+
+    role: UserRole | None = None
+    is_active: bool | None = None
+
+
+class PasswordReset(BaseModel):
+    password: str
+
+    _check_password = field_validator("password")(validate_password_strength)
 
 
 class UserOut(BaseModel):
@@ -37,8 +76,8 @@ class UserOut(BaseModel):
 
 # ---- Branches ----
 class BranchCreate(BaseModel):
-    name: str
-    description: str | None = None
+    name: ShortText
+    description: LongText | None = None
 
 
 class BranchOut(BaseModel):
@@ -118,7 +157,7 @@ class ExportRequest(BaseModel):
     columns: list[str]
     # Pre-filter: master column -> accepted values (OR within a field, AND across).
     filters: dict[str, list[str]] = {}
-    sheet_name: str | None = None
+    sheet_name: Annotated[str, Field(max_length=100)] | None = None
 
 
 class VerifyRequest(BaseModel):

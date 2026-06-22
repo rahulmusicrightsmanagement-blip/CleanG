@@ -5,6 +5,9 @@ services:
     environment:
       # Frontend is served same-origin via nginx, but keep CORS explicit.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      # Keep true in production (HTTPS). Set COOKIE_SECURE=false only when
+      # serving the app over plain HTTP from a non-localhost host.
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
     ports:
       - "3000:8000"
     healthcheck:
