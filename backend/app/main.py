@@ -51,18 +51,9 @@ def _migrate(db) -> None:
         "ALTER TABLE uploaded_files "
         "ADD COLUMN IF NOT EXISTS dropped JSONB NOT NULL DEFAULT '[]'::jsonb"
     ))
-    # Token-revocation + brute-force-lockout columns for pre-existing user tables.
     db.execute(text(
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"
-    ))
-    db.execute(text(
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS failed_logins INTEGER NOT NULL DEFAULT 0"
-    ))
-    db.execute(text(
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"
+        "ALTER TABLE uploaded_files "
+        "ADD COLUMN IF NOT EXISTS accepted JSONB NOT NULL DEFAULT '[]'::jsonb"
     ))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.

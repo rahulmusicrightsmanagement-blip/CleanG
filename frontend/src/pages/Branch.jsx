@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client.js";
+import { useAuth } from "../context/AuthContext.jsx";
 import Icon from "../components/Icon.jsx";
 import UploadStep from "../components/UploadStep.jsx";
 import MappingStep from "../components/MappingStep.jsx";
@@ -20,11 +21,28 @@ const COMPLETED = { uploaded: 1, mapped: 2, cleaned: 3, committed: 4 };
 
 export default function Branch() {
   const { branchId } = useParams();
+  const { user } = useAuth();
+  const navigate = useNavigate();
   const [branch, setBranch] = useState(null);
   const [file, setFile] = useState(null);
   const [step, setStep] = useState("upload");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [showDelete, setShowDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  async function deleteBranch() {
+    setDeleting(true);
+    setError("");
+    try {
+      await api(`/api/branches/${branchId}`, { method: "DELETE" });
+      navigate("/");
+    } catch (err) {
+      setError(err.message);
+      setDeleting(false);
+      setShowDelete(false);
+    }
+  }
 
   // The current step is owned by the user. We only auto-position it once,
   // on the first load of a branch — never again on later re-renders or when a
@@ -108,10 +126,46 @@ export default function Branch() {
 
   return (
     <section>
-      <div className="crumbs">
-        <Link to="/">Branches</Link> <span>/</span>{" "}
-        <strong>{branch ? branch.name : "…"}</strong>
+      <div className="crumbs crumbs-row">
+        <div>
+          <Link to="/">Branches</Link> <span>/</span>{" "}
+          <strong>{branch ? branch.name : "…"}</strong>
+        </div>
+        {user?.role === "admin" && branch && (
+          <button className="btn sm danger" onClick={() => setShowDelete(true)}>
+            <Icon name="trash" size={14} /> Delete branch
+          </button>
+        )}
       </div>
+
+      {showDelete && (
+        <div className="save-overlay" onClick={() => setShowDelete(false)}>
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark danger">
+              <Icon name="trash" size={22} />
+            </div>
+            <h3>Delete this branch?</h3>
+            <p className="muted">
+              This permanently removes <strong>{branch?.name}</strong>, its
+              uploaded files and any master records saved from it. This cannot be
+              undone.
+            </p>
+            <div className="confirm-actions">
+              <button
+                className="btn sm"
+                onClick={() => setShowDelete(false)}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+              <button className="btn sm danger" onClick={deleteBranch} disabled={deleting}>
+                <Icon name="trash" size={15} />
+                {deleting ? "Deleting…" : "Delete branch"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Overall progress + locked linear stepper */}
       <div className="wiz">

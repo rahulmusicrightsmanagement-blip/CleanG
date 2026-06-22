@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client.js";
+import { useAuth } from "../context/AuthContext.jsx";
 import Icon from "../components/Icon.jsx";
 
 const STEP_LABELS = ["Not started", "Uploaded", "Mapped", "Cleaned", "Saved"];
 
 export default function Dashboard() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [branches, setBranches] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -15,6 +18,24 @@ export default function Dashboard() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const [deleteTarget, setDeleteTarget] = useState(null); // branch pending deletion
+  const [deleting, setDeleting] = useState(false);
+
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setError("");
+    try {
+      await api(`/api/branches/${deleteTarget.id}`, { method: "DELETE" });
+      setBranches((prev) => prev.filter((b) => b.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   async function load() {
     setLoading(true);
@@ -207,7 +228,22 @@ export default function Dashboard() {
                   <div className="branch-icon">
                     <Icon name="branch" size={18} />
                   </div>
-                  <span className={`status-pill ${b.status}`}>{b.status}</span>
+                  <div className="branch-card-actions">
+                    <span className={`status-pill ${b.status}`}>{b.status}</span>
+                    {isAdmin && (
+                      <button
+                        className="branch-del"
+                        title="Delete branch"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDeleteTarget(b);
+                        }}
+                      >
+                        <Icon name="trash" size={15} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="branch-card-head">
                   <h3>{b.name}</h3>
@@ -245,6 +281,35 @@ export default function Dashboard() {
               </Link>
             );
           })}
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="save-overlay" onClick={() => setDeleteTarget(null)}>
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark danger">
+              <Icon name="trash" size={22} />
+            </div>
+            <h3>Delete this branch?</h3>
+            <p className="muted">
+              This permanently removes <strong>{deleteTarget.name}</strong>, its
+              uploaded files and any master records saved from it. This cannot be
+              undone.
+            </p>
+            <div className="confirm-actions">
+              <button
+                className="btn sm"
+                onClick={() => setDeleteTarget(null)}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+              <button className="btn sm danger" onClick={confirmDelete} disabled={deleting}>
+                <Icon name="trash" size={15} />
+                {deleting ? "Deleting…" : "Delete branch"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>

@@ -259,6 +259,7 @@ class ColumnProfile(BaseModel):
     filled: int
     blank: int
     distinct: int
+    unique: int  # distinct count, pipe-aware for name fields (Singer 1 | Singer 2 -> 2)
     fixed: int  # cells meaningfully auto-corrected in this column
     normalized: int  # cells only tidied (whitespace/case/unicode)
     errors: int  # cells still flagged in this column
@@ -280,6 +281,20 @@ class DataProfile(BaseModel):
     row_strip: list[int]  # per-row (possibly downsampled) worst status: 0 ok, 1 fixed, 2 error
     strip_scale: int  # how many real rows each strip entry represents (1 = no downsampling)
     columns: list[ColumnProfile]
+
+
+class UniqueValue(BaseModel):
+    value: str
+    count: int  # how many rows carry it (incl. inside pipe-separated name cells)
+
+
+class UniqueValuesOut(BaseModel):
+    """The distinct values of one column, pipe-split for name fields. Powers the
+    per-column "Show unique values" side panel in Review."""
+
+    column: str
+    total_distinct: int  # full distinct count (before any cap)
+    values: list[UniqueValue]  # most-common first, capped
 
 
 class CleanRowOut(BaseModel):
@@ -304,6 +319,19 @@ class ReviewOut(BaseModel):
 
 class RowEdit(BaseModel):
     values: dict[str, str]
+
+
+class RowsBatchEdit(BaseModel):
+    """Apply several reviewers' edits at once: {row_index: {column: value}}."""
+
+    edits: dict[str, dict[str, str]]
+
+
+class RowsAccept(BaseModel):
+    """Keep rows as-is (clear their flags). Empty `rows` + a `tag` query param
+    means: accept every row carrying that error type."""
+
+    rows: list[int] = []
 
 
 class BulkFix(BaseModel):
