@@ -33,6 +33,9 @@ const TAG_COLORS = {
   standardized_category: "#16a34a",
   normalized_language: "#10b981",
   normalized_percent: "#06b6d4",
+  combined_columns: "#0ea5e9",
+  derived_lead_artist: "#0284c7",
+  filled_constant: "#0369a1",
   // Human change (merge / inline edit / bulk set) — distinct indigo so a cell you
   // manipulated stands out from the tool's own green auto-fixes.
   corrected: "#6366f1",
@@ -70,6 +73,12 @@ export default function ReviewStep({ file, onCommitted }) {
   const [draftTags, setDraftTags] = useState([]);
   const [draftSortCol, setDraftSortCol] = useState("");
   const [draftSortDir, setDraftSortDir] = useState("asc");
+
+  // --- Fill a column with a constant value (empties only) ---
+  const [showFill, setShowFill] = useState(false);
+  const [fillCol, setFillCol] = useState("");
+  const [fillVal, setFillVal] = useState("");
+  const [fillBusy, setFillBusy] = useState(false);
 
   // --- Column header interactions ---
   const [headerMenuCol, setHeaderMenuCol] = useState(null); // open popover column
@@ -110,11 +119,19 @@ export default function ReviewStep({ file, onCommitted }) {
 
   // Headers come straight from the mapping we already have, so the grid frame
   // renders instantly instead of waiting on the network.
-  const columns = useMemo(
-    () =>
-      (file.mapping || [])
-        .filter((m) => m.input_header)
-        .map((m) => m.master_column),
+  const columns = useMemo(() => {
+    // The server reports the authoritative output columns (mapped + auto-derived
+    // Lead Artist + any constant-filled columns) in canonical master order. Fall
+    // back to the mapping for the very first paint, before the summary arrives.
+    if (summary?.columns?.length) return summary.columns;
+    return (file.mapping || [])
+      .filter((m) => m.input_header)
+      .map((m) => m.master_column);
+  }, [file.mapping, summary]);
+
+  // Every master column (mapped or not) — the pick list for "Add column value".
+  const allMasterColumns = useMemo(
+    () => (file.mapping || []).map((m) => m.master_column),
     [file.mapping]
   );
 
@@ -442,6 +459,34 @@ export default function ReviewStep({ file, onCommitted }) {
   function removeTagFilter(tag) {
     setActiveTags((t) => t.filter((x) => x !== tag));
     setPage(0);
+  }
+
+  // --- Fill a column with a constant value (empty cells only) ----------------
+  function openFill(col = "") {
+    setHeaderMenuCol(null);
+    const chosen = col || allMasterColumns[0] || "";
+    setFillCol(chosen);
+    setFillVal((file.constants && file.constants[chosen]) || "");
+    setShowFill(true);
+  }
+
+  // Setting an empty value clears the constant for that column.
+  async function applyFill() {
+    if (!fillCol) return;
+    setFillBusy(true);
+    setError("");
+    try {
+      const d = await api(
+        `/api/files/${file.id}/columns/${encodeURIComponent(fillCol)}/fill?${buildQs(true)}`,
+        { method: "POST", body: { value: fillVal } }
+      );
+      applyPayload(d);
+      setShowFill(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setFillBusy(false);
+    }
   }
 
   // --- Column header menu / editing / unique values --------------------------
@@ -958,6 +1003,14 @@ export default function ReviewStep({ file, onCommitted }) {
               <span className="filter-n">{activeTags.length + (sortCol ? 1 : 0)}</span>
             )}
           </button>
+          <button
+            className="btn sm"
+            onClick={() => openFill()}
+            title="Fill every empty cell of a column with one value (filled cells are left untouched)"
+          >
+            <Icon name="plus" size={14} />
+            Add column value
+          </button>
         </div>
         <button
           className="btn sm primary"
@@ -1411,6 +1464,9 @@ export default function ReviewStep({ file, onCommitted }) {
           <button onClick={() => startEditCol(headerMenuCol)}>
             <Icon name="edit" size={13} /> Edit column
           </button>
+          <button onClick={() => openFill(headerMenuCol)}>
+            <Icon name="plus" size={13} /> Fill empty cells…
+          </button>
           <button onClick={() => openUnique(headerMenuCol)}>
             <Icon name="table" size={13} /> Show unique values
             {uniqueByCol[headerMenuCol] != null
@@ -1479,6 +1535,71 @@ export default function ReviewStep({ file, onCommitted }) {
               </button>
               <button className="btn primary sm" onClick={applyFilters}>
                 Apply filter
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fill-a-column popup — broadcast a constant into empty cells only */}
+      {showFill && (
+        <div className="save-overlay" onClick={() => setShowFill(false)}>
+          <div className="filter-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="filter-modal-head">
+              <h3>
+                <Icon name="plus" size={16} /> Add a column value
+              </h3>
+              <button className="icon-btn" onClick={() => setShowFill(false)}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">Column</label>
+              <select
+                value={fillCol}
+                onChange={(e) => {
+                  const c = e.target.value;
+                  setFillCol(c);
+                  setFillVal((file.constants && file.constants[c]) || "");
+                }}
+              >
+                {allMasterColumns.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">
+                Value to fill into empty cells
+              </label>
+              <input
+                placeholder="e.g. Artium | Goongoonalo  or  50 | 50"
+                value={fillVal}
+                onChange={(e) => setFillVal(e.target.value)}
+                autoFocus
+              />
+              <p className="muted small" style={{ marginTop: "0.5rem" }}>
+                This fills <strong>every empty cell</strong> of{" "}
+                <strong>{fillCol || "the column"}</strong> with this value. Cells
+                that already have a value are <strong>left untouched</strong>.
+                Clear the box and apply to remove the fill.
+              </p>
+            </div>
+
+            <div className="filter-modal-actions">
+              <button className="btn sm" onClick={() => setShowFill(false)} disabled={fillBusy}>
+                Cancel
+              </button>
+              <button
+                className="btn primary sm"
+                onClick={applyFill}
+                disabled={fillBusy || !fillCol}
+              >
+                {fillBusy ? "Filling…" : fillVal.trim() ? "Fill empty cells" : "Clear fill"}
               </button>
             </div>
           </div>

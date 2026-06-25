@@ -40,6 +40,7 @@ from ..schemas import (
     BulkFix,
     CleanRowOut,
     CleanSummary,
+    ColumnFill,
     ColumnProfile,
     CommitRequest,
     CommitResult,
@@ -95,7 +96,16 @@ def _get_file_or_404(file_id: int, user: User, db: Session) -> UploadedFile:
 
 
 def _active_columns(f: UploadedFile) -> list[str]:
-    return [m["master_column"] for m in f.mapping if m.get("input_header")]
+    active = {m["master_column"] for m in f.mapping if m.get("input_header")}
+    # Columns given a constant fill are output columns even with no input source.
+    active |= set(f.constants or {})
+    # Lead Artist is auto-derived from Singer/Composer/Lyricist, so it's a real
+    # output column whenever any contributing credit (or Lead Artist) is present.
+    if active & {"Singer", "Composer", "Lyricist", "Lead Artist"}:
+        active.add("Lead Artist")
+    # Return in canonical master-schema order so derived/filled columns slot into
+    # their natural position rather than tacking onto the end.
+    return [c for c in MASTER_COLUMN_TO_ATTR if c in active]
 
 
 def _is_name_column(col: str) -> bool:
@@ -134,7 +144,10 @@ _CACHE_LIMIT = 16
 def _signature(f: UploadedFile) -> str:
     # `data` is immutable after upload, so only the overlay + mapping vary.
     return json.dumps(
-        [f.mapping, f.corrections or {}, f.dropped or [], f.accepted or []],
+        [
+            f.mapping, f.corrections or {}, f.dropped or [],
+            f.accepted or [], f.constants or {},
+        ],
         sort_keys=True, default=str,
     )
 
@@ -181,7 +194,7 @@ def _entry(f: UploadedFile) -> dict:
     if hit and hit["sig"] == sig:
         return hit
 
-    base = clean_dataset(f.data, f.headers, f.mapping)
+    base = clean_dataset(f.data, f.headers, f.mapping, f.constants or {})
     corrections = f.corrections or {}
     dropped = set(f.dropped or [])
     accepted = set(f.accepted or [])
@@ -709,6 +722,49 @@ def remap_column_value(
             override[column] = new
             corrections[str(r.index)] = override
     f.corrections = corrections
+    db.commit()
+    _invalidate(file_id)
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        contains_col=contains_col, contains_val=contains_val,
+    )
+
+
+@router.post("/api/files/{file_id}/columns/{column}/fill", response_model=ReviewOut)
+def fill_column(
+    file_id: int,
+    column: str,
+    payload: ColumnFill,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    contains_col: str | None = None,
+    contains_val: str | None = None,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Set a whole-column constant that fills every EMPTY cell of `column` with the
+    given value — existing values are never overwritten. A blank value clears the
+    constant. The column becomes an output column even if no input feeds it, so a
+    batch-wide value (e.g. Revenue Share / Revenue Split) can be added in one go.
+    Returns the refreshed Review payload."""
+    f = _get_file_or_404(file_id, user, db)
+    if column not in MASTER_COLUMN_TO_ATTR:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown master column.")
+
+    constants = dict(f.constants or {})
+    value = payload.value.strip()
+    if value:
+        constants[column] = payload.value
+    else:
+        constants.pop(column, None)
+    f.constants = constants
     db.commit()
     _invalidate(file_id)
     return _review_payload(

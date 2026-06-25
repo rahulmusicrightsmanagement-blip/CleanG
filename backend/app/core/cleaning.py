@@ -27,8 +27,20 @@ _ISRC = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
 
 # Delimiter used when several names / source columns are merged into one field.
 NAME_SEP = " | "
-# Split an input name cell on commas or pipes into individual names.
-_NAME_SPLIT = re.compile(r"\s*[|,]\s*")
+# Split an input name cell into individual names. Names are joined by a pipe, a
+# comma, an ampersand, or the word "and" (any case) — e.g. "Vishal & Shekhar",
+# "A and B", "A, B" all split. The "and" arm requires surrounding whitespace so
+# it never breaks a name that merely contains the letters (e.g. "Anderson").
+# Only applied to name-type fields (Singer / Composer / Lyricist / Lead Artist).
+_NAME_SPLIT = re.compile(r"\s*[|,&]\s*|\s+and\s+", re.IGNORECASE)
+# Split an already-cleaned, pipe-joined name cell back into its individual names.
+_PIPE_SPLIT = re.compile(r"\s*\|\s*")
+
+# Lead Artist is a roll-up of the creative/performing credits. It's filled from
+# these columns, in this priority order — any names already in Lead Artist are
+# kept, then the rest are added from Singer / Composer / Lyricist. A person
+# credited in more than one role (e.g. singer AND composer) appears only once.
+LEAD_ARTIST_SOURCES = ("Lead Artist", "Singer", "Composer", "Lyricist")
 
 # Field types that hold one-or-more human names (people). These get per-name
 # Title-casing, comma/pipe splitting and name-shape validation.
@@ -111,6 +123,8 @@ FIX_LABELS = {
     "normalized_percent": "Standardized percentage",
     "titlecased": "Standardized name casing",
     "combined_columns": "Merged from multiple columns",
+    "derived_lead_artist": "Filled Lead Artist",
+    "filled_constant": "Filled blank cell",
     "corrected": "Manually corrected",
 }
 
@@ -618,16 +632,103 @@ def clean_value(master_column: str, raws: list) -> Cell:
     return Cell(merged, "fixed", tag="combined_columns", original=original)
 
 
+def derive_lead_artist(values: dict) -> str:
+    """Build the Lead Artist roll-up: the unique union of Lead Artist (existing),
+    Singer, Composer and Lyricist, in that priority order.
+
+    Each source is already pipe-joined and Title-cased by the cleaner, so we split
+    on the pipe and de-duplicate case-insensitively while preserving first-seen
+    order and casing. A name that appears in several roles is therefore written
+    once (Singer == Composer -> one entry)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for col in LEAD_ARTIST_SOURCES:
+        for piece in _PIPE_SPLIT.split(values.get(col) or ""):
+            piece = piece.strip()
+            if not piece:
+                continue
+            key = piece.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(piece)
+    return NAME_SEP.join(out)
+
+
+def _apply_lead_artist(values: dict, issues: list[dict]) -> None:
+    """Fill / verify the Lead Artist column in place from its source credits.
+
+    - If Lead Artist already holds names, they're kept and the missing ones are
+      added (never dropped) — a true verify-and-fill.
+    - No-op when nothing contributes and there's no Lead Artist column at all.
+    - Skipped while Lead Artist itself carries a hard error (the human resolves it
+      first). The fill is recorded as an auto-fix so the grid shows what happened.
+    """
+    if any(i["column"] == "Lead Artist" and i["action"] == "error" for i in issues):
+        return
+    derived = derive_lead_artist(values)
+    if not derived and "Lead Artist" not in values:
+        return
+    prev = values.get("Lead Artist", "")
+    if derived == prev:
+        return  # already complete — leave any existing issue untouched
+    values["Lead Artist"] = derived
+    # Replace any prior auto-fix note for this column with the roll-up note.
+    issues[:] = [
+        i for i in issues
+        if not (i["column"] == "Lead Artist" and i["action"] == "fixed")
+    ]
+    issues.append({
+        "column": "Lead Artist",
+        "action": "fixed",
+        "tag": "derived_lead_artist",
+        "message": "Filled from Singer / Composer / Lyricist (duplicates removed).",
+        "value": derived,
+        "original": prev,
+        "cosmetic": False,
+    })
+
+
+def _apply_constants(
+    values: dict, issues: list[dict], constants: dict[str, str]
+) -> None:
+    """Broadcast per-column constant values into EMPTY cells only.
+
+    A column with a constant gets that value wherever the row's cell is blank; a
+    cell that already holds anything is left completely untouched. The constant is
+    run through the column's normal cleaner (so e.g. a "50|50" Revenue Split is
+    standardized like any other value) and recorded as an auto-fill so the grid
+    shows where it landed."""
+    for col, raw in (constants or {}).items():
+        if values.get(col):
+            continue  # never overwrite an existing value
+        cell = clean_cell(col, raw)
+        values[col] = cell.value
+        if cell.action == "error":
+            issues.append(_issue(col, cell))
+        elif cell.value != "":
+            issues.append({
+                "column": col,
+                "action": "fixed",
+                "tag": "filled_constant",
+                "message": "Filled this blank cell with the column value you set.",
+                "value": cell.value,
+                "original": "",
+                "cosmetic": False,
+            })
+
+
 def clean_dataset(
     rows: list[list],
     headers: list[str],
     mapping: list[dict],
+    constants: dict[str, str] | None = None,
 ) -> list[CleanRow]:
     """Clean every row. `mapping` is the master-centric list (master_column, input_header).
 
     Cleaning runs on whatever columns are mapped — the master format does NOT need
-    to be fully present. Duplicate detection is a separate cross-row pass
-    (`mark_duplicates`) so it can run after human corrections are applied.
+    to be fully present. `constants` fills empty cells of named columns with a
+    fixed value (existing values untouched). Duplicate detection is a separate
+    cross-row pass (`mark_duplicates`) so it can run after human corrections.
     """
     header_index = {h: i for i, h in enumerate(headers)}
     # Only the mapped master columns participate in the output.
@@ -661,6 +762,12 @@ def clean_dataset(
                     "message": f"{master} is required but empty.",
                     "value": "", "original": cell.original or "",
                 })
+
+        # Broadcast any whole-column constants into this row's empty cells...
+        _apply_constants(values, issues, constants or {})
+        # ...then roll the credits up into Lead Artist (so a constant-filled
+        # credit also feeds the roll-up).
+        _apply_lead_artist(values, issues)
 
         results.append(CleanRow(index=r_idx, values=values, issues=issues))
 
@@ -849,6 +956,8 @@ def revalidate(values: dict[str, str]) -> tuple[dict[str, str], list[dict]]:
                 "message": f"{master} is required but empty.",
                 "value": "", "original": str(raw),
             })
+    # Re-derive Lead Artist so an edit to Singer/Composer/Lyricist reflows into it.
+    _apply_lead_artist(cleaned, issues)
     return cleaned, issues
 
 

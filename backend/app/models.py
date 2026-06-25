@@ -120,6 +120,10 @@ class UploadedFile(Base):
     # Row indexes the reviewer accepted as-is: their flags are cleared and the
     # values kept unchanged (a deliberate "keep this data" override).
     accepted: Mapped[list] = mapped_column(JSON, default=list)
+    # Per-column constant fills: {"<master_column>": "value"}. Applied ONLY to
+    # rows where that column is empty (existing values are never overwritten), so
+    # a whole-batch value (e.g. Revenue Share / Split) can be broadcast at once.
+    constants: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[FileStatus] = mapped_column(
         Enum(FileStatus, name="file_status"), default=FileStatus.uploaded
     )

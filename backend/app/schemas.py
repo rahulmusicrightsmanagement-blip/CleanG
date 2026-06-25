@@ -235,6 +235,7 @@ class FileOut(BaseModel):
     headers: list[str]
     mapping: list[MappingItem]
     warnings: list[str]
+    constants: dict[str, str] = {}
     status: FileStatus
     created_at: datetime
 
@@ -403,6 +404,13 @@ class BulkFix(BaseModel):
     column: str | None = None
     action: str  # "set" | "drop"
     value: str | None = None
+
+
+class ColumnFill(BaseModel):
+    """Set (or clear, when blank) a whole-column constant. The value is broadcast
+    into every EMPTY cell of the column; an empty value removes the constant."""
+
+    value: Annotated[str, Field(max_length=2000)] = ""
 
 
 class ValueRemap(BaseModel):
