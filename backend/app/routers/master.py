@@ -1,12 +1,15 @@
 import io
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
+from ..core.audit import log_event
 from ..core.http import content_disposition
+from ..core.limiter import limiter
 from ..core.master_store import record_to_dict
 from ..core.presets import (
     ALL_COLUMNS,
@@ -108,6 +111,7 @@ def _attr(col: str) -> str:
         )
     return attr
 
+settings = get_settings()
 router = APIRouter(prefix="/api/master", tags=["master"])
 
 
@@ -272,7 +276,9 @@ def verify_filters(
 
 
 @router.post("/export")
+@limiter.limit(settings.heavy_rate_limit)
 def export_master(
+    request: Request,
     payload: ExportRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -290,9 +296,13 @@ def export_master(
     ws = wb.active
     ws.title = (payload.sheet_name or "Master data")[:31]
     ws.append([c for c, _ in cols])
+    n = 0
     for rec in db.scalars(stmt):
         ws.append([getattr(rec, attr) or "" for _, attr in cols])
+        n += 1
 
+    log_event(db, request, "master_export", user=user,
+              detail=f"{n} record(s), {len(cols)} column(s)")
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

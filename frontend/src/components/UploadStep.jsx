@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { CSRF_HEADER_NAME, csrfToken } from "../api/client.js";
 import Icon from "./Icon.jsx";
 
 const MAX_BYTES = 20 * 1024 * 1024; // keep in sync with the backend cap
@@ -57,6 +58,9 @@ export default function UploadStep({ branchId, existing, onUploaded }) {
     xhr.open("POST", `/api/branches/${branchId}/files`);
     // Send the httpOnly session cookie with the upload.
     xhr.withCredentials = true;
+    // ...and the CSRF token, since this multipart POST bypasses the api() wrapper.
+    const csrf = csrfToken();
+    if (csrf) xhr.setRequestHeader(CSRF_HEADER_NAME, csrf);
 
     // Real byte-for-byte upload progress.
     xhr.upload.onprogress = (e) => {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client.js";
+import Icon from "../components/Icon.jsx";
 
 const EMPTY = { email: "", full_name: "", password: "", role: "user" };
 
@@ -9,6 +10,7 @@ export default function AdminUsers() {
   const [error, setError] = useState("");
   const [form, setForm] = useState(EMPTY);
   const [busy, setBusy] = useState(false);
+  const [showPw, setShowPw] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -79,13 +81,25 @@ export default function AdminUsers() {
         <div className="form-row">
           <label>
             Temporary password
-            <input
-              type="text"
-              value={form.password}
-              onChange={(e) => update("password", e.target.value)}
-              minLength={12}
-              required
-            />
+            <span className="pw-wrap">
+              <input
+                type={showPw ? "text" : "password"}
+                value={form.password}
+                onChange={(e) => update("password", e.target.value)}
+                minLength={12}
+                required
+              />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => setShowPw((s) => !s)}
+                aria-label={showPw ? "Hide password" : "Show password"}
+                title={showPw ? "Hide password" : "Show password"}
+                tabIndex={-1}
+              >
+                <Icon name={showPw ? "eyeOff" : "eye"} size={18} />
+              </button>
+            </span>
             <small className="muted">
               Min 12 characters, with an uppercase letter, a lowercase letter and
               a digit.

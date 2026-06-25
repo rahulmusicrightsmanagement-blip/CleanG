@@ -30,6 +30,19 @@ export function AuthProvider({ children }) {
       body: { email, password },
     });
     setUser(me);
+    return me;
+  }
+
+  // Self-service password change. On success the server clears the forced-change
+  // flag and re-issues the session; we adopt the returned user so the app
+  // unblocks immediately.
+  async function changePassword(currentPassword, newPassword) {
+    const me = await api("/api/auth/change-password", {
+      method: "POST",
+      body: { current_password: currentPassword, new_password: newPassword },
+    });
+    setUser(me);
+    return me;
   }
 
   async function logout() {
@@ -42,7 +55,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, changePassword }}>
       {children}
     </AuthContext.Provider>
   );

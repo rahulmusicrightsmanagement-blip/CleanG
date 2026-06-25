@@ -35,6 +35,10 @@ class User(Base):
         Enum(UserRole, name="user_role"), default=UserRole.user
     )
     is_active: Mapped[bool] = mapped_column(default=True)
+    # Forces a password change on next login (set for the bootstrap admin, and
+    # after an admin reset). The app gates everything but the change-password
+    # endpoint until the user clears it.
+    must_change_password: Mapped[bool] = mapped_column(default=False)
     # Bumped on logout / deactivate / password reset to revoke outstanding tokens.
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     # Brute-force lockout bookkeeping.
@@ -253,4 +257,30 @@ class ActivityLog(Base):
     skipped_errors: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AuditEvent(Base):
+    """Security audit trail for authentication and privileged actions.
+
+    Separate from `ActivityLog` (which is about data commits): this records WHO
+    did WHAT from WHERE — logins (success/failure/lockout), logout, password
+    changes, user provisioning, role/active changes, password resets and exports.
+    `user_id` is nullable because a failed login may not resolve to a real user;
+    the attempted email is always kept.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
     )

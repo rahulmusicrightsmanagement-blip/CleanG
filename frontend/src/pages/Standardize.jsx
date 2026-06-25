@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { CSRF_HEADER_NAME, csrfToken } from "../api/client.js";
 import Icon from "../components/Icon.jsx";
 
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -16,7 +17,13 @@ function formatBytes(n) {
 async function postJSON(path, file) {
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(path, { method: "POST", credentials: "include", body: form });
+  const csrf = csrfToken();
+  const res = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers: csrf ? { [CSRF_HEADER_NAME]: csrf } : {},
+    body: form,
+  });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const detail = data.detail;
@@ -38,6 +45,8 @@ function postDownload(path, file, onStage) {
     xhr.open("POST", path);
     xhr.withCredentials = true;
     xhr.responseType = "blob";
+    const csrf = csrfToken();
+    if (csrf) xhr.setRequestHeader(CSRF_HEADER_NAME, csrf);
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onStage("uploading", e.loaded / e.total);
