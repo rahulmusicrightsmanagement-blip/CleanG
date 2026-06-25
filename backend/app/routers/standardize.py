@@ -9,11 +9,22 @@ Two endpoints share the same engine:
 
 import io
 
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from openpyxl import Workbook
 
+from ..config import get_settings
 from ..core.excel import MAX_BYTES
 from ..core.http import content_disposition
+from ..core.limiter import limiter
 from ..core.standardize import (
     StandardizeError,
     load_table,
@@ -24,6 +35,7 @@ from ..deps import get_current_user
 from ..models import User
 from ..schemas import StandardizeMapping, StandardizePreview
 
+settings = get_settings()
 router = APIRouter(prefix="/api/standardize", tags=["standardize"])
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -49,7 +61,9 @@ async def _read_table(file: UploadFile) -> tuple[str, list, list]:
 
 
 @router.post("/preview", response_model=StandardizePreview)
+@limiter.limit(settings.upload_rate_limit)
 async def preview(
+    request: Request,
     file: UploadFile = File(...),
     _user: User = Depends(get_current_user),
 ):
@@ -70,7 +84,9 @@ async def preview(
 
 
 @router.post("/download")
+@limiter.limit(settings.upload_rate_limit)
 async def download(
+    request: Request,
     file: UploadFile = File(...),
     _user: User = Depends(get_current_user),
 ):

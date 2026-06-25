@@ -1,16 +1,19 @@
 import io
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
 
+from ..config import get_settings
 from ..core.excel import MAX_BYTES, ExcelValidationError, read_and_validate
+from ..core.limiter import limiter
 from ..core.matching import suggest_mapping
 from ..database import get_db
 from ..deps import get_current_user
 from ..models import Branch, FileStatus, MasterColumn, UploadedFile, User, UserRole
 from ..schemas import BranchOut, FileOut, MappingUpdate, PreviewOut, WorkspaceOut
 
+settings = get_settings()
 router = APIRouter(tags=["files"])
 
 
@@ -85,7 +88,9 @@ def workspace(
     response_model=FileOut,
     status_code=status.HTTP_201_CREATED,
 )
+@limiter.limit(settings.upload_rate_limit)
 async def upload_file(
+    request: Request,
     branch_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),

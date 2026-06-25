@@ -21,11 +21,14 @@ def _extract_token(request: Request, bearer: str | None) -> str | None:
     return cookie or bearer
 
 
-def get_current_user(
+def get_authenticated_user(
     request: Request,
     token: str | None = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
+    """Resolve the session to a live, active user. Does NOT enforce the
+    password-change gate — used by the few self-service auth endpoints (me,
+    logout, change-password) that must stay reachable while a change is pending."""
     credentials_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -48,6 +51,19 @@ def get_current_user(
     # Reject tokens minted before the user's current version (revoked sessions).
     if payload.get("ver", 0) != user.token_version:
         raise credentials_error
+    return user
+
+
+def get_current_user(user: User = Depends(get_authenticated_user)) -> User:
+    """The standard guard for application routes: a valid session AND no pending
+    forced password change. While `must_change_password` is set, every protected
+    route returns 403 `password_change_required` so the SPA can route the user
+    straight to the change-password screen and nowhere else."""
+    if user.must_change_password:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="password_change_required",
+        )
     return user
 
 

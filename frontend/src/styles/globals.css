@@ -507,6 +507,25 @@ input::placeholder {
   font-weight: 600;
   color: var(--amber);
 }
+/* Live password-policy checklist on the change-password screen. */
+.pw-rules {
+  list-style: none;
+  margin: 0.2rem 0 0.4rem;
+  padding: 0;
+  display: grid;
+  gap: 0.3rem;
+}
+.pw-rules li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--muted, #6b7280);
+}
+.pw-rules li.ok {
+  color: var(--green, #2fa084);
+  font-weight: 600;
+}
 .auth-submit {
   justify-content: center;
   margin-top: 0.3rem;
@@ -697,6 +716,20 @@ input::placeholder {
 }
 .create-form .btn {
   align-self: flex-start;
+}
+/* Password field + reveal toggle in the create-account form. */
+.pw-wrap {
+  position: relative;
+  display: block;
+}
+.pw-wrap input {
+  width: 100%;
+  /* Leave room so typed characters never sit under the eye button. */
+  padding-right: 2.6rem;
+}
+.pw-wrap .pw-toggle {
+  top: 50%;
+  transform: translateY(-50%);
 }
 @keyframes pop {
   from {

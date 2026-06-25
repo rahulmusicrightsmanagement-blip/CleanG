@@ -1,11 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..core.audit import log_event
 from ..database import get_db
 from ..deps import require_admin
-from ..models import User
-from ..schemas import PasswordReset, UserCreate, UserOut, UserUpdate
+from ..models import AuditEvent, User
+from ..schemas import (
+    AuditEventOut,
+    PasswordReset,
+    UserCreate,
+    UserOut,
+    UserUpdate,
+)
 from ..security import hash_password
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -28,9 +35,10 @@ def list_users(
 
 @router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def create_user(
+    request: Request,
     payload: UserCreate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
 ):
     """Admin-only: provision an account. There is no public registration."""
     existing = db.scalar(select(User).where(User.email == payload.email))
@@ -44,15 +52,20 @@ def create_user(
         full_name=payload.full_name,
         hashed_password=hash_password(payload.password),
         role=payload.role,
+        # The admin set this initial password, so the new user must pick their own.
+        must_change_password=True,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+    log_event(db, request, "user_created", user=admin,
+              detail=f"created {user.email} (role={user.role.value}, id={user.id})")
     return user
 
 
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(
+    request: Request,
     user_id: int,
     payload: UserUpdate,
     db: Session = Depends(get_db),
@@ -68,31 +81,55 @@ def update_user(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "You cannot deactivate your own account."
         )
-    if payload.role is not None:
+    changes = []
+    if payload.role is not None and payload.role != user.role:
+        changes.append(f"role {user.role.value}->{payload.role.value}")
         user.role = payload.role
-    if payload.is_active is not None:
+    if payload.is_active is not None and payload.is_active != user.is_active:
+        changes.append(f"active {user.is_active}->{payload.is_active}")
         user.is_active = payload.is_active
         if payload.is_active is False:
             user.token_version += 1
     db.commit()
     db.refresh(user)
+    if changes:
+        log_event(db, request, "user_updated", user=admin,
+                  detail=f"{user.email} (id={user.id}): {', '.join(changes)}")
     return user
 
 
 @router.post("/{user_id}/reset-password", response_model=UserOut)
 def reset_password(
+    request: Request,
     user_id: int,
     payload: PasswordReset,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
 ):
     """Admin-only: set a new password and revoke the user's existing sessions."""
     user = _get_user_or_404(user_id, db)
     user.hashed_password = hash_password(payload.password)
+    # The admin chose this password, so force the user to set their own next login.
+    user.must_change_password = True
     # Invalidate any token issued before the reset, and clear any lockout.
     user.token_version += 1
     user.failed_logins = 0
     user.locked_until = None
     db.commit()
     db.refresh(user)
+    log_event(db, request, "password_reset", user=admin,
+              detail=f"reset password for {user.email} (id={user.id})")
     return user
+
+
+@router.get("/audit", response_model=list[AuditEventOut])
+def audit_events(
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """Admin-only: the security audit trail (logins, lockouts, user changes,
+    password resets), most recent first."""
+    return db.scalars(
+        select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(limit)
+    ).all()

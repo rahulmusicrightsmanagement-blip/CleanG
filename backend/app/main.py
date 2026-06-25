@@ -6,9 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import select, text
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 from .config import get_settings
+from .core.csrf import csrf_protect
 from .core.limiter import limiter
 from .database import Base, SessionLocal, engine
 from .models import MasterColumn, User, UserRole
@@ -55,6 +57,11 @@ def _migrate(db) -> None:
         "ALTER TABLE uploaded_files "
         "ADD COLUMN IF NOT EXISTS accepted JSONB NOT NULL DEFAULT '[]'::jsonb"
     ))
+    # Forced-password-rotation flag, added for databases created before it existed.
+    db.execute(text(
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE"
+    ))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.
     db.execute(text("DROP TABLE IF EXISTS cleaned_rows"))
@@ -75,6 +82,9 @@ def init_db() -> None:
                     full_name=settings.admin_name,
                     hashed_password=hash_password(settings.admin_password),
                     role=UserRole.admin,
+                    # The bootstrap password comes from the environment and is
+                    # known to whoever deployed it — force a change on first login.
+                    must_change_password=True,
                 )
             )
             db.commit()
@@ -104,13 +114,24 @@ app = FastAPI(title="MRM Cleanser API", version="0.1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
+# Reject requests with an unexpected Host header (host-header poisoning) unless
+# the allowlist is left as the "*" wildcard (local dev / not yet configured).
+if "*" not in settings.trusted_host_list:
+    app.add_middleware(
+        TrustedHostMiddleware, allowed_hosts=settings.trusted_host_list
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    # The CSRF token travels in this header, so it must be allowed cross-origin.
+    allow_headers=["Authorization", "Content-Type", settings.csrf_header_name],
 )
+
+# CSRF double-submit enforcement for cookie-authenticated, state-changing calls.
+app.middleware("http")(csrf_protect)
 
 
 _SECURITY_HEADERS = {

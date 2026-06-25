@@ -2,11 +2,14 @@ import io
 import json
 from collections import Counter
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
+
+from ..config import get_settings
+from ..core.limiter import limiter
 
 from ..core.cleaning import (
     FIELD_TYPES,
@@ -71,6 +74,7 @@ def _grade(score: int) -> str:
             return letter
     return "F"
 
+settings = get_settings()
 router = APIRouter(tags=["clean"])
 
 
@@ -718,7 +722,9 @@ _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @router.get("/api/files/{file_id}/export")
+@limiter.limit(settings.heavy_rate_limit)
 def export_rows(
+    request: Request,
     file_id: int,
     view: str = "error",
     tag: str | None = None,
@@ -959,7 +965,9 @@ def check_conflicts(
 
 
 @router.post("/api/files/{file_id}/commit", response_model=CommitResult)
+@limiter.limit(settings.heavy_rate_limit)
 def commit_clean(
+    request: Request,
     file_id: int,
     payload: CommitRequest | None = None,
     db: Session = Depends(get_db),

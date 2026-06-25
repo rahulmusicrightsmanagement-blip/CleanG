@@ -32,15 +32,46 @@ class Settings(BaseSettings):
 
     # Session cookie hardening. `cookie_secure` MUST stay true in production
     # (cookie only sent over HTTPS); set COOKIE_SECURE=false only for local
-    # plain-HTTP development.
+    # plain-HTTP development. `strict` SameSite is the default — this is a
+    # same-origin SPA with no cross-site redirect flows, so it costs nothing and
+    # closes the cross-site request surface further than `lax`.
     cookie_secure: bool = True
-    cookie_samesite: str = "lax"
+    cookie_samesite: str = "strict"
     cookie_name: str = "mrm_session"
+
+    # CSRF double-submit token. A readable (non-httpOnly) cookie is set at login;
+    # the SPA echoes it back in the header on every state-changing request, and
+    # the server requires the two to match. A cross-site attacker can ride the
+    # session cookie but cannot read the CSRF cookie (same-origin policy) to forge
+    # the header.
+    csrf_cookie_name: str = "mrm_csrf"
+    csrf_header_name: str = "X-CSRF-Token"
 
     # Brute-force protection on the login endpoint.
     login_rate_limit: str = "10/minute"
     max_failed_logins: int = 5
     lockout_minutes: int = 15
+
+    # Shared rate-limit storage. Default is per-process memory (fine for a single
+    # worker / local dev); set REDIS_URL in production so limits hold across
+    # workers and replicas. e.g. redis://redis:6379/0
+    redis_url: str = ""
+
+    # Throttles for expensive endpoints (uploads, exports, standardize, commit).
+    heavy_rate_limit: str = "30/minute"
+    upload_rate_limit: str = "20/minute"
+
+    # Host header allowlist (TrustedHostMiddleware). Comma-separated. Leave as "*"
+    # to disable the check; set to your real hostnames in production.
+    trusted_hosts: str = "*"
+
+    @property
+    def trusted_host_list(self) -> list[str]:
+        return [h.strip() for h in self.trusted_hosts.split(",") if h.strip()]
+
+    @property
+    def rate_limit_storage_uri(self) -> str:
+        return self.redis_url or "memory://"
 
     @property
     def cors_origin_list(self) -> list[str]:

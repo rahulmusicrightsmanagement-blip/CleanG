@@ -35,9 +35,29 @@ class LoginRequest(BaseModel):
     password: Annotated[str, Field(min_length=1, max_length=128)]
 
 
+class ChangePassword(BaseModel):
+    current_password: Annotated[str, Field(min_length=1, max_length=128)]
+    new_password: str
+
+    _check_password = field_validator("new_password")(validate_password_strength)
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+class AuditEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    action: str
+    user_id: int | None
+    email: str | None
+    ip: str | None
+    user_agent: str | None
+    detail: str | None
+    created_at: datetime
 
 
 # ---- Users ----
@@ -71,6 +91,7 @@ class UserOut(BaseModel):
     full_name: str
     role: UserRole
     is_active: bool
+    must_change_password: bool = False
     created_at: datetime
 
 
@@ -152,16 +173,25 @@ class ExportOptions(BaseModel):
     total_records: int
 
 
+# Bounds for the filter map shared by export/verify: master schema is ~30 fields,
+# and a handful of values per field is normal — cap generously but finitely so a
+# crafted body can't blow up memory or fan out into thousands of SQL conditions.
+FilterMap = Annotated[
+    dict[str, Annotated[list[ShortText], Field(max_length=100)]],
+    Field(max_length=50),
+]
+
+
 class ExportRequest(BaseModel):
     # Final ordered list of master columns to export (preset + extras, or custom).
-    columns: list[str]
+    columns: Annotated[list[ShortText], Field(min_length=1, max_length=100)]
     # Pre-filter: master column -> accepted values (OR within a field, AND across).
-    filters: dict[str, list[str]] = {}
+    filters: FilterMap = {}
     sheet_name: Annotated[str, Field(max_length=100)] | None = None
 
 
 class VerifyRequest(BaseModel):
-    filters: dict[str, list[str]] = {}
+    filters: FilterMap = {}
 
 
 class VerifyValue(BaseModel):
@@ -225,8 +255,11 @@ class MappingUpdate(BaseModel):
     so several input columns can be directed into one master column.
     """
 
-    assignments: dict[str, str | None]
-    extra: dict[str, list[str]] = {}
+    assignments: Annotated[dict[str, str | None], Field(max_length=500)]
+    extra: Annotated[
+        dict[str, Annotated[list[ShortText], Field(max_length=100)]],
+        Field(max_length=500),
+    ] = {}
 
 
 class PreviewOut(BaseModel):
@@ -339,21 +372,30 @@ class ReviewOut(BaseModel):
     page_size: int
 
 
+# One row's edited cells: at most one value per master column (~30), each bounded.
+RowValues = Annotated[
+    dict[str, Annotated[str, Field(max_length=2000)]], Field(max_length=200)
+]
+
+
 class RowEdit(BaseModel):
-    values: dict[str, str]
+    values: RowValues
 
 
 class RowsBatchEdit(BaseModel):
-    """Apply several reviewers' edits at once: {row_index: {column: value}}."""
+    """Apply several reviewers' edits at once: {row_index: {column: value}}.
 
-    edits: dict[str, dict[str, str]]
+    Capped so a single request can't carry an unbounded payload (one entry per
+    row, bounded cells per row)."""
+
+    edits: Annotated[dict[str, RowValues], Field(max_length=100_000)]
 
 
 class RowsAccept(BaseModel):
     """Keep rows as-is (clear their flags). Empty `rows` + a `tag` query param
     means: accept every row carrying that error type."""
 
-    rows: list[int] = []
+    rows: Annotated[list[int], Field(max_length=1_000_000)] = []
 
 
 class BulkFix(BaseModel):
@@ -371,7 +413,7 @@ class ValueRemap(BaseModel):
     canonical value to keep. Many variants -> one `to` is supported.
     """
 
-    from_values: list[ShortText]
+    from_values: Annotated[list[ShortText], Field(min_length=1, max_length=1000)]
     to: ShortText
 
 
@@ -406,7 +448,7 @@ class CommitRequest(BaseModel):
     """Optional body for the commit: the reviewer's call on each near-duplicate,
     keyed by row index. Absent rows take the normal dedup path."""
 
-    resolutions: dict[str, ConflictResolution] = {}
+    resolutions: Annotated[dict[str, ConflictResolution], Field(max_length=100_000)] = {}
 
 
 class CommitResult(BaseModel):

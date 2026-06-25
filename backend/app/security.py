@@ -1,8 +1,10 @@
+
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from jose import JWTError, jwt
+import jwt
+from jwt import PyJWTError
 
 from .config import get_settings
 
@@ -16,6 +18,13 @@ def _encode(password: str) -> bytes:
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(_encode(password), bcrypt.gensalt()).decode("utf-8")
+
+
+# A fixed bcrypt hash of a random, unknowable password. The login flow verifies
+# the submitted password against THIS when the email doesn't exist, so a missing
+# account costs the same bcrypt work as a real one — closing the timing channel
+# that would otherwise reveal which emails are registered. Computed once at import.
+DUMMY_PASSWORD_HASH = hash_password(uuid.uuid4().hex)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -38,10 +47,19 @@ def create_access_token(subject: str, token_version: int = 0) -> str:
 
 
 def decode_access_token(token: str) -> dict | None:
-    """Return the token payload, or None if invalid/expired."""
+    """Return the token payload, or None if invalid/expired.
+
+    `algorithms` is pinned to a single symmetric algorithm so a token forged with
+    `alg: none` or an asymmetric-key confusion trick is rejected. Expiry and the
+    presence of `sub`/`exp` are required, so a malformed/expired token never
+    resolves to a user.
+    """
     try:
         return jwt.decode(
-            token, settings.secret_key, algorithms=[settings.algorithm]
+            token,
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={"require": ["exp", "sub"]},
         )
-    except JWTError:
+    except PyJWTError:
         return None
