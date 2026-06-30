@@ -316,6 +316,11 @@ input::placeholder {
   grid-template-columns: 1.05fr 1fr;
   background: var(--bg);
 }
+/* Standalone auth screens (e.g. forced password change) have no brand aside,
+   so render as a single centered column instead of an empty half. */
+.auth-shell.auth-solo {
+  grid-template-columns: 1fr;
+}
 
 /* Brand showcase */
 .auth-aside {
@@ -477,6 +482,10 @@ input::placeholder {
 .field-control input {
   width: 100%;
   padding: 0.72rem 0.85rem 0.72rem 2.5rem;
+}
+/* Leave room for the show/hide eye button so typed text never slides under it. */
+.field-control:has(.pw-toggle) input {
+  padding-right: 2.7rem;
 }
 .field-control:focus-within .field-icon {
   color: var(--brand);
