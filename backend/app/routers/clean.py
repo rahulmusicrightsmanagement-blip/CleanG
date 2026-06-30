@@ -103,9 +103,18 @@ def _active_columns(f: UploadedFile) -> list[str]:
     # output column whenever any contributing credit (or Lead Artist) is present.
     if active & {"Singer", "Composer", "Lyricist", "Lead Artist"}:
         active.add("Lead Artist")
-    # Return in canonical master-schema order so derived/filled columns slot into
-    # their natural position rather than tacking onto the end.
-    return [c for c in MASTER_COLUMN_TO_ATTR if c in active]
+    # Canonical master columns first, in schema order so derived/filled columns
+    # slot into their natural position; user-added custom columns (not part of the
+    # fixed schema, e.g. "Mood") follow, in the order their mapping rows appear.
+    canonical = [c for c in MASTER_COLUMN_TO_ATTR if c in active]
+    custom = [
+        m["master_column"]
+        for m in f.mapping
+        if m["master_column"] in active
+        and m["master_column"] not in MASTER_COLUMN_TO_ATTR
+    ]
+    seen = set(canonical)
+    return canonical + [c for c in custom if not (c in seen or seen.add(c))]
 
 
 def _is_name_column(col: str) -> bool:

@@ -67,6 +67,16 @@ def _migrate(db) -> None:
         "ALTER TABLE users "
         "ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE"
     ))
+    # Custom (user-added) master columns: a flag on the schema table + a JSON bag
+    # on each record to hold their values, for databases created before the feature.
+    db.execute(text(
+        "ALTER TABLE master_columns "
+        "ADD COLUMN IF NOT EXISTS custom BOOLEAN NOT NULL DEFAULT FALSE"
+    ))
+    db.execute(text(
+        "ALTER TABLE master_data "
+        "ADD COLUMN IF NOT EXISTS extras JSONB NOT NULL DEFAULT '{}'::jsonb"
+    ))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.
     db.execute(text("DROP TABLE IF EXISTS cleaned_rows"))

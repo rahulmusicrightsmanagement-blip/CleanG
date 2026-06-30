@@ -23,6 +23,7 @@ export default function MappingStep({ file, onSaved, onNext }) {
     )
   );
   const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState("");
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(file.status === "mapped");
   const [query, setQuery] = useState("");
@@ -118,6 +119,31 @@ export default function MappingStep({ file, onSaved, onNext }) {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Promote an unmapped input column (e.g. "Mood") into the master schema so its
+  // values are kept and saved, instead of being dropped. The server adds it to
+  // the master columns and wires it into this file's mapping.
+  async function addToMaster(header) {
+    setError("");
+    setAdding(header);
+    try {
+      const updated = await api(`/api/files/${file.id}/columns`, {
+        method: "POST",
+        body: { input_header: header },
+      });
+      const entry = updated.mapping.find((m) => m.input_header === header);
+      if (entry) {
+        setChoices((c) => ({ ...c, [entry.master_column]: header }));
+        setExtras((e) => ({ ...e, [entry.master_column]: e[entry.master_column] || [] }));
+      }
+      onSaved(updated);
+      setSaved(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAdding("");
     }
   }
 
@@ -353,11 +379,27 @@ export default function MappingStep({ file, onSaved, onNext }) {
 
       {trulyUnused.length > 0 && (
         <div className="card unused">
-          <strong>Unused input columns:</strong> {trulyUnused.join(", ")}
-          <p className="muted small" style={{ margin: "0.35rem 0 0" }}>
-            These exist in your file but have no place in the master format — they
-            won’t appear in the output.
+          <strong>New columns found</strong>
+          <p className="muted small" style={{ margin: "0.35rem 0 0.6rem" }}>
+            These exist in your file but aren’t part of the master format, so they
+            won’t be saved. Add any you want to keep to the master data.
           </p>
+          <div className="unused-list">
+            {trulyUnused.map((h) => (
+              <div key={h} className="unused-col">
+                <span className="unused-name">{h}</span>
+                <button
+                  type="button"
+                  className="btn small"
+                  onClick={() => addToMaster(h)}
+                  disabled={adding === h}
+                >
+                  <Icon name="plus" size={13} />
+                  {adding === h ? "Adding…" : "Add to master data"}
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
