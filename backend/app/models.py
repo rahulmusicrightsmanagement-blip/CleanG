@@ -88,6 +88,10 @@ class MasterColumn(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     position: Mapped[int] = mapped_column(Integer, unique=True)
     name: Mapped[str] = mapped_column(String(255))
+    # True for columns a user added from an uploaded file (e.g. "Mood") that are
+    # not part of the seeded master format. Their values live in
+    # MasterData.extras (a JSON bag) rather than a dedicated typed column.
+    custom: Mapped[bool] = mapped_column(default=False)
 
 
 class UploadedFile(Base):
@@ -237,6 +241,10 @@ class MasterData(Base):
     territory_restriction: Mapped[str] = mapped_column(String, default="")
     lead_artist: Mapped[str] = mapped_column(String, default="")
     agreement_no: Mapped[str] = mapped_column(String, default="")
+
+    # Values for user-added custom columns (not in the fixed schema above),
+    # keyed by master column name: {"Mood": "Happy"}.
+    extras: Mapped[dict] = mapped_column(JSON, default=dict)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

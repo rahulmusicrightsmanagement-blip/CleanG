@@ -123,6 +123,7 @@ class MasterColumnOut(BaseModel):
 
     position: int
     name: str
+    custom: bool = False
 
 
 class MasterDataPage(BaseModel):
@@ -261,6 +262,19 @@ class MappingUpdate(BaseModel):
         dict[str, Annotated[list[ShortText], Field(max_length=100)]],
         Field(max_length=500),
     ] = {}
+
+
+class AddMasterColumn(BaseModel):
+    """Promote an unmapped input column into the master schema.
+
+    `input_header` is an existing header in the file; `name` is the master column
+    name to create (defaults to the header). The column is registered in the
+    master schema (as a custom column unless its name already exists) and wired
+    into this file's mapping so its values flow through to the master data.
+    """
+
+    input_header: ShortText
+    name: ShortText | None = None
 
 
 class PreviewOut(BaseModel):

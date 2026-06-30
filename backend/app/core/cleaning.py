@@ -35,6 +35,11 @@ NAME_SEP = " | "
 _NAME_SPLIT = re.compile(r"\s*[|,&]\s*|\s+and\s+", re.IGNORECASE)
 # Split an already-cleaned, pipe-joined name cell back into its individual names.
 _PIPE_SPLIT = re.compile(r"\s*\|\s*")
+# In a Label cell, several labels can be joined by "&" or the word "and"/"And"
+# (any case) — normalize those joiners to a pipe so multi-label cells read
+# uniformly. The "and" arm requires surrounding whitespace so it never breaks a
+# value that merely contains the letters (e.g. "Brand"). Label-only.
+_LABEL_JOIN = re.compile(r"\s*&\s*|\s+and\s+", re.IGNORECASE)
 
 # Lead Artist is a roll-up of the creative/performing credits. It's filled from
 # these columns, in this priority order — any names already in Lead Artist are
@@ -56,7 +61,7 @@ _SUSPECT_CHARS = set("$%@#^*=+~<>{}[]\\\"`")
 # --- field type per master column -----------------------------------------
 FIELD_TYPES: dict[str, str] = {
     "Record #": "serial",
-    "Label": "category",
+    "Label": "label",
     "ISRC": "isrc",
     "Date Submitted": "date",
     "UPC": "upc",
@@ -145,6 +150,7 @@ _FIX_TAG_BY_TYPE = {
     "title": "titlecased",
     "category": "trimmed",
     "serial": "trimmed",
+    "label": "standardized_category",
 }
 
 # Values that look like data but mean "nothing here": lone punctuation, common
@@ -535,6 +541,18 @@ def _clean_category(value) -> Cell:
     return _clean_text(value)
 
 
+def _clean_label(value) -> Cell:
+    """Clean a record-label cell; same as category but joins multi-label cells
+    on a pipe — any "&", "and" or "And" between labels becomes " | "."""
+    raw = "" if value is None else str(value)
+    base = _base_text(value)
+    gate = _blank_or_junk(raw, base)
+    if gate:
+        return gate
+    out = _LABEL_JOIN.sub(" | ", base)
+    return Cell(out, "fixed" if out != raw else "ok", original=raw)
+
+
 def _clean_serial(value) -> Cell:
     raw = "" if value is None else str(value)
     base = _base_text(value)
@@ -574,6 +592,7 @@ _CLEANERS = {
     "date": _clean_date, "duration": _clean_duration,
     "vocal_instrumental": _clean_vocal, "language": _clean_language,
     "category": _clean_category, "serial": _clean_serial, "percent": _clean_percent,
+    "label": _clean_label,
 }
 
 

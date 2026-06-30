@@ -46,6 +46,24 @@ def _row_attrs(values: dict) -> dict:
     }
 
 
+def _extras(values: dict) -> dict:
+    """Non-blank values for user-added custom columns (anything keyed by a master
+    column name that isn't part of the fixed 30-column schema)."""
+    return {
+        col: val
+        for col, val in values.items()
+        if col not in MASTER_COLUMN_TO_ATTR and (val or "").strip()
+    }
+
+
+def _store_extras(target: "MasterData", values: dict) -> None:
+    """Merge a row's custom-column values onto a record, keeping prior extras from
+    other files and overwriting only the columns this row carries."""
+    extra = _extras(values)
+    if extra:
+        target.extras = {**(target.extras or {}), **extra}
+
+
 def _ownership_differs(existing: MasterData, values: dict) -> bool:
     for col in OWNERSHIP_FIELDS:
         attr = MASTER_COLUMN_TO_ATTR.get(col)
@@ -123,6 +141,7 @@ def upsert_master_records(
                 if master is not None and (clash is None or clash is master):
                     for attr, val in _row_attrs(values).items():
                         setattr(master, attr, val)
+                    _store_extras(master, values)
                     master.fingerprint = fp
                     master.branch_id = branch_id
                     master.file_id = file_id
@@ -142,6 +161,7 @@ def upsert_master_records(
                 branch_id=branch_id,
                 file_id=file_id,
                 fingerprint=fp,
+                extras=_extras(values),
                 **_row_attrs(values),
             )
             pending[fp] = obj
@@ -150,10 +170,14 @@ def upsert_master_records(
             # Same recording, new owner -> keep the latest values (and source refs).
             for attr, val in _row_attrs(values).items():
                 setattr(target, attr, val)
+            _store_extras(target, values)
             target.branch_id = branch_id
             target.file_id = file_id
             updated += 1
         else:
+            # Identity + ownership already match. Still fold in any custom-column
+            # values this row carries that the stored record is missing.
+            _store_extras(target, values)
             duplicates += 1
 
     db.add_all(pending.values())  # one batched INSERT, committed by the caller
@@ -298,11 +322,17 @@ def find_conflicts(db: Session, rows: list) -> list[dict]:
 
 def record_to_dict(rec: MasterData, columns: list[str] | None = None) -> dict:
     """A master row as {master column name: value}, optionally projected to
-    just `columns` — this is how any required field is extracted on demand."""
-    cols = columns or list(MASTER_COLUMN_TO_ATTR)
+    just `columns` — this is how any required field is extracted on demand.
+
+    Custom (user-added) columns are resolved from the record's `extras` bag, so a
+    field like "Mood" reads back the same way as a built-in column."""
+    extras = rec.extras or {}
+    cols = columns or [*MASTER_COLUMN_TO_ATTR, *extras]
     out = {}
     for col in cols:
         attr = MASTER_COLUMN_TO_ATTR.get(col)
         if attr is not None:
             out[col] = getattr(rec, attr)
+        elif col in extras:
+            out[col] = extras[col]
     return out

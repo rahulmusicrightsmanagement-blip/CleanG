@@ -1548,6 +1548,32 @@ input::placeholder {
   box-shadow: none;
 }
 
+.unused-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.unused-col {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.35rem 0.5rem 0.35rem 0.7rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.unused-name {
+  font-weight: 600;
+}
+
+.btn.small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  gap: 0.3rem;
+}
+
 /* ---------- Clean step ---------- */
 .clean-stats {
   display: grid;

@@ -136,10 +136,21 @@ def master_data(
 ):
     """Extract stored master records, optionally projected to just the fields
     asked for — the structured table makes any field a cheap column read."""
+    # Built-in schema plus any user-added custom columns (their values live in
+    # each record's `extras` bag and are resolved by `record_to_dict`).
+    custom_cols = list(db.scalars(
+        select(MasterColumn.name)
+        .where(MasterColumn.custom.is_(True))
+        .order_by(MasterColumn.position)
+    ).all())
+    known = list(MASTER_COLUMN_TO_ATTR) + [
+        c for c in custom_cols if c not in MASTER_COLUMN_TO_ATTR
+    ]
     columns = None
     if fields:
         wanted = [c.strip() for c in fields.split(",") if c.strip()]
-        columns = [c for c in wanted if c in MASTER_COLUMN_TO_ATTR]
+        columns = [c for c in wanted if c in known]
+    projection = columns or known
     total = _scoped_count(db, user)
     recs = db.scalars(
         _scope(select(MasterData), user)
@@ -148,8 +159,8 @@ def master_data(
         .limit(limit)
     ).all()
     return MasterDataPage(
-        columns=columns or list(MASTER_COLUMN_TO_ATTR),
-        rows=[record_to_dict(r, columns) for r in recs],
+        columns=projection,
+        rows=[record_to_dict(r, projection) for r in recs],
         total=total,
     )
 

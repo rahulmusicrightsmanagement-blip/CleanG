@@ -1,7 +1,7 @@
 import io
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, defer
 
 from ..config import get_settings
@@ -10,8 +10,23 @@ from ..core.limiter import limiter
 from ..core.matching import suggest_mapping
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import Branch, FileStatus, MasterColumn, UploadedFile, User, UserRole
-from ..schemas import BranchOut, FileOut, MappingUpdate, PreviewOut, WorkspaceOut
+from ..models import (
+    MASTER_COLUMN_TO_ATTR,
+    Branch,
+    FileStatus,
+    MasterColumn,
+    UploadedFile,
+    User,
+    UserRole,
+)
+from ..schemas import (
+    AddMasterColumn,
+    BranchOut,
+    FileOut,
+    MappingUpdate,
+    PreviewOut,
+    WorkspaceOut,
+)
 
 settings = get_settings()
 router = APIRouter(tags=["files"])
@@ -236,6 +251,82 @@ def update_mapping(
 
     f.mapping = new_mapping
     f.status = FileStatus.mapped
+    db.commit()
+    db.refresh(f)
+    return f
+
+
+@router.post("/api/files/{file_id}/columns", response_model=FileOut)
+def add_master_column(
+    file_id: int,
+    payload: AddMasterColumn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Promote an unmapped input column (e.g. "Mood") into the master schema and
+    wire it into this file's mapping, so its values are kept and saved to the
+    master data instead of being dropped.
+
+    The column is registered once in `master_columns` (reused on later files); if
+    its name already matches a built-in master column, the input is simply mapped
+    onto that column rather than creating a duplicate.
+    """
+    f = _get_file_or_404(file_id, user, db)
+
+    header = payload.input_header.strip()
+    if header not in f.headers:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"'{header}' is not a header in this file.",
+        )
+
+    name = (payload.name or header).strip()
+    if not name:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "A column name is required."
+        )
+
+    # Resolve (or create) the master column this header should feed.
+    if name in MASTER_COLUMN_TO_ATTR:
+        column = db.scalar(select(MasterColumn).where(MasterColumn.name == name))
+        master_col = name
+        position = column.position if column else list(MASTER_COLUMN_TO_ATTR).index(name) + 1
+    else:
+        column = db.scalar(
+            select(MasterColumn).where(func.lower(MasterColumn.name) == name.lower())
+        )
+        if column is None:
+            next_pos = (db.scalar(select(func.max(MasterColumn.position))) or 0) + 1
+            column = MasterColumn(position=next_pos, name=name, custom=True)
+            db.add(column)
+            db.flush()  # assign position/id before we reference it below
+        master_col = column.name
+        position = column.position
+
+    # Wire it into this file's mapping. Reuse an existing row for the column
+    # (re-pointing its source) instead of adding a duplicate entry.
+    mapping = [dict(m) for m in f.mapping]
+    entry = next((m for m in mapping if m["master_column"] == master_col), None)
+    if entry is None:
+        entry = {
+            "master_column": master_col,
+            "position": position,
+            "input_header": header,
+            "extra_headers": [],
+            "confidence": 1.0,
+            "method": "manual",
+            "needs_review": False,
+        }
+        mapping.append(entry)
+    else:
+        entry.update(
+            input_header=header,
+            method="manual",
+            confidence=1.0,
+            needs_review=False,
+        )
+
+    f.mapping = mapping
     db.commit()
     db.refresh(f)
     return f
