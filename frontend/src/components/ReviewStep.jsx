@@ -477,7 +477,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setError("");
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(fillCol)}/fill?${buildQs(true)}`,
+        `/api/files/${file.id}/columns/fill?column=${encodeURIComponent(fillCol)}&${buildQs(true)}`,
         { method: "POST", body: { value: fillVal } }
       );
       applyPayload(d);
@@ -529,7 +529,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setUniqueLoading(true);
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/unique`
+        `/api/files/${file.id}/columns/unique?column=${encodeURIComponent(col)}`
       );
       setUniqueValues(d.values || []);
     } catch (e) {
@@ -544,7 +544,7 @@ export default function ReviewStep({ file, onCommitted }) {
   async function reloadUnique(col) {
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/unique`
+        `/api/files/${file.id}/columns/unique?column=${encodeURIComponent(col)}`
       );
       setUniqueValues(d.values || []);
     } catch (e) {
@@ -602,7 +602,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setError("");
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(uniqueCol)}/remap/preview`,
+        `/api/files/${file.id}/columns/remap/preview?column=${encodeURIComponent(uniqueCol)}`,
         { method: "POST", body: { from_values: from, to } }
       );
       setMergeConfirm({ from, to, count: d.affected_rows });
@@ -622,7 +622,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setError("");
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/remap?${buildQs(true)}`,
+        `/api/files/${file.id}/columns/remap?column=${encodeURIComponent(col)}&${buildQs(true)}`,
         {
           method: "POST",
           body: { from_values: mergeConfirm.from, to: mergeConfirm.to },

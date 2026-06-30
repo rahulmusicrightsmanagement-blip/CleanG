@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..core.audit import log_event
@@ -120,6 +121,46 @@ def reset_password(
     log_event(db, request, "password_reset", user=admin,
               detail=f"reset password for {user.email} (id={user.id})")
     return user
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    request: Request,
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin-only: permanently delete a user account.
+
+    A user with committed data (owns branches that already wrote to the master
+    set) cannot be hard-deleted without losing that audit chain, so the FK
+    blocks it — deactivate those accounts instead. Security audit rows are kept
+    but detached (user_id -> NULL) so the trail survives the deletion.
+    """
+    user = _get_user_or_404(user_id, db)
+    if user.id == admin.id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "You cannot delete your own account."
+        )
+    email = user.email
+    # Preserve the security audit trail but detach it from the row being removed.
+    db.execute(
+        update(AuditEvent).where(AuditEvent.user_id == user.id).values(user_id=None)
+    )
+    try:
+        db.delete(user)  # cascades to the user's branches + their uploaded files
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This user owns branches with committed data and can't be deleted. "
+            "Deactivate the account instead.",
+        )
+    log_event(
+        db, request, "user_deleted", user=admin,
+        detail=f"deleted {email} (id={user_id})",
+    )
 
 
 @router.get("/audit", response_model=list[AuditEventOut])

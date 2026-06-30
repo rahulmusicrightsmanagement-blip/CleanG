@@ -1,0 +1,4 @@
+# Local-dev files that bridge the production compose config to a localhost run.
+# They contain secrets / publish host ports and must never be committed.
+/.env
+/docker-compose.override.yml
