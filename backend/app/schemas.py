@@ -10,11 +10,11 @@ from .models import BranchStatus, FileStatus, UserRole
 ShortText = Annotated[str, Field(min_length=1, max_length=255)]
 LongText = Annotated[str, Field(max_length=2000)]
 
-_PASSWORD_MIN = 12
+_PASSWORD_MIN = 8
 
 
 def validate_password_strength(value: str) -> str:
-    """Reject weak passwords: >=12 chars with upper, lower and digit."""
+    """Reject weak passwords: >=8 chars with upper, lower and digit."""
     if len(value) < _PASSWORD_MIN:
         raise ValueError(f"Password must be at least {_PASSWORD_MIN} characters long.")
     if len(value) > 128:

@@ -12,9 +12,10 @@ from starlette.responses import Response
 from .config import get_settings
 from .core.csrf import csrf_protect
 from .core.limiter import limiter
+from .core.scheduler import shutdown_scheduler, start_scheduler
 from .database import Base, SessionLocal, engine
 from .models import MasterColumn, User, UserRole
-from .routers import auth, branches, clean, files, master, standardize, users
+from .routers import auth, branches, clean, files, master, reports, standardize, users
 from .security import hash_password
 
 settings = get_settings()
@@ -110,7 +111,11 @@ def init_db() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    start_scheduler()  # daily report email (10:30 IST by default)
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
 
 
 def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> Response:
@@ -175,6 +180,7 @@ app.include_router(master.router)
 app.include_router(files.router)
 app.include_router(clean.router)
 app.include_router(standardize.router)
+app.include_router(reports.router)
 
 
 @app.get("/api/health")

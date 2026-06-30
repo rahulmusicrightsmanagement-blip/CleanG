@@ -610,7 +610,7 @@ def clean_rows(
 _UNIQUE_CAP = 1000  # bound the side-panel payload for very high-cardinality columns
 
 
-@router.get("/api/files/{file_id}/columns/{column}/unique", response_model=UniqueValuesOut)
+@router.get("/api/files/{file_id}/columns/unique", response_model=UniqueValuesOut)
 def column_unique_values(
     file_id: int,
     column: str,
@@ -667,7 +667,7 @@ def _remap_alias(payload: ValueRemap) -> dict[str, str]:
 
 
 @router.post(
-    "/api/files/{file_id}/columns/{column}/remap/preview", response_model=RemapPreview
+    "/api/files/{file_id}/columns/remap/preview", response_model=RemapPreview
 )
 def remap_preview(
     file_id: int,
@@ -692,7 +692,7 @@ def remap_preview(
     return RemapPreview(affected_rows=affected)
 
 
-@router.post("/api/files/{file_id}/columns/{column}/remap", response_model=ReviewOut)
+@router.post("/api/files/{file_id}/columns/remap", response_model=ReviewOut)
 def remap_column_value(
     file_id: int,
     column: str,
@@ -740,7 +740,7 @@ def remap_column_value(
     )
 
 
-@router.post("/api/files/{file_id}/columns/{column}/fill", response_model=ReviewOut)
+@router.post("/api/files/{file_id}/columns/fill", response_model=ReviewOut)
 def fill_column(
     file_id: int,
     column: str,
