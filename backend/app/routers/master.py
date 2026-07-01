@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..core.audit import log_event
+from ..core.dynamic_columns import master_column_attrs
 from ..core.http import content_disposition
 from ..core.limiter import limiter
 from ..core.master_store import record_to_dict
@@ -104,9 +105,9 @@ _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 def _custom_column_names(db: Session) -> list[str]:
-    """User-added custom column names, in schema order. Their values are NOT
-    stored in a dedicated MasterData attribute but inside the `extras` JSON bag,
-    so they're resolved from there on read/export."""
+    """User-added custom column names, in schema order. Each has a real
+    master_data column (resolved via dynamic_columns.master_column_attrs) and is
+    read/exported exactly like a built-in column."""
     return list(db.scalars(
         select(MasterColumn.name)
         .where(MasterColumn.custom.is_(True))
@@ -138,13 +139,10 @@ def master_data(
 ):
     """Extract stored master records, optionally projected to just the fields
     asked for — the structured table makes any field a cheap column read."""
-    # Built-in schema plus any user-added custom columns (their values live in
-    # each record's `extras` bag and are resolved by `record_to_dict`).
-    custom_cols = list(db.scalars(
-        select(MasterColumn.name)
-        .where(MasterColumn.custom.is_(True))
-        .order_by(MasterColumn.position)
-    ).all())
+    # Built-in schema plus any user-added custom columns (real columns on
+    # master_data, resolved through the full name->attr map).
+    col_attr = master_column_attrs(db)
+    custom_cols = _custom_column_names(db)
     known = list(MASTER_COLUMN_TO_ATTR) + [
         c for c in custom_cols if c not in MASTER_COLUMN_TO_ATTR
     ]
@@ -162,7 +160,7 @@ def master_data(
     ).all()
     return MasterDataPage(
         columns=projection,
-        rows=[record_to_dict(r, projection) for r in recs],
+        rows=[record_to_dict(r, projection, col_attr) for r in recs],
         total=total,
     )
 
@@ -176,10 +174,10 @@ def export_options(
     columns), the full column list for a fully-custom export, and the fields the
     user can pre-filter on.
 
-    User-added custom columns (stored in each record's `extras` bag) are folded in
-    too: they extend the fully-custom column list AND become appendable extras on
-    every preset (PDL / SVF), so any extra column captured at upload can be
-    exported alongside the built-in schema."""
+    User-added custom columns (real master_data columns) are folded in too: they
+    extend the fully-custom column list AND become appendable extras on every
+    preset (PDL / SVF), so any column captured at upload can be exported alongside
+    the built-in schema."""
     total = _scoped_count(db, user)
     custom_cols = _custom_column_names(db)
     all_columns = list(ALL_COLUMNS) + [c for c in custom_cols if c not in ALL_COLUMNS]
@@ -261,8 +259,9 @@ def preview_master(
 
     Same filtering semantics as export, but returns rows as JSON for on-screen
     display instead of streaming an xlsx. Purely a read — nothing is modified."""
+    col_attr = master_column_attrs(db)
     if payload.columns:
-        cols = [c for c in payload.columns if c in MASTER_COLUMN_TO_ATTR]
+        cols = [c for c in payload.columns if c in col_attr]
     else:
         cols = list(MASTER_COLUMN_TO_ATTR)
     if not cols:
@@ -277,7 +276,7 @@ def preview_master(
     ).all()
     return MasterDataPage(
         columns=cols,
-        rows=[record_to_dict(r, cols) for r in recs],
+        rows=[record_to_dict(r, cols, col_attr) for r in recs],
         total=total,
     )
 
@@ -349,34 +348,26 @@ def export_master(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one column to export."
         )
-    # Validate + resolve every requested column up front. Built-in columns read
-    # from a real MasterData attribute; user-added custom columns read from the
-    # record's `extras` JSON bag. Anything else is rejected.
-    custom = set(_custom_column_names(db))
-    cols: list[tuple[str, str, bool]] = []  # (column, key, from_extras)
+    # Validate + resolve every requested column up front. Built-in and custom
+    # columns alike read from a real MasterData attribute; anything else is rejected.
+    col_attr = master_column_attrs(db)
+    cols: list[tuple[str, str]] = []  # (column, attr)
     for c in payload.columns:
-        attr = MASTER_COLUMN_TO_ATTR.get(c)
-        if attr is not None:
-            cols.append((c, attr, False))
-        elif c in custom:
-            cols.append((c, c, True))
-        else:
+        attr = col_attr.get(c)
+        if attr is None:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown column: {c!r}"
             )
+        cols.append((c, attr))
     stmt = _filtered_query(payload.filters, user).order_by(MasterData.id)
 
     wb = Workbook()
     ws = wb.active
     ws.title = (payload.sheet_name or "Master data")[:31]
-    ws.append([c for c, _, _ in cols])
+    ws.append([c for c, _ in cols])
     n = 0
     for rec in db.scalars(stmt):
-        extras = rec.extras or {}
-        ws.append([
-            (extras.get(key, "") if from_extras else getattr(rec, key)) or ""
-            for _, key, from_extras in cols
-        ])
+        ws.append([getattr(rec, attr) or "" for _, attr in cols])
         n += 1
 
     log_event(db, request, "master_export", user=user,

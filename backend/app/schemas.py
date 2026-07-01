@@ -124,6 +124,8 @@ class MasterColumnOut(BaseModel):
     position: int
     name: str
     custom: bool = False
+    # Physical master_data column name for custom columns; None for built-ins.
+    attr: str | None = None
 
 
 class MasterDataPage(BaseModel):

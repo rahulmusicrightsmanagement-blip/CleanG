@@ -24,6 +24,8 @@ export default function MappingStep({ file, onSaved, onNext }) {
   );
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState("");
+  // The new column awaiting confirmation: { header, name } while the modal is open.
+  const [pendingCol, setPendingCol] = useState(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(file.status === "mapped");
   const [query, setQuery] = useState("");
@@ -123,15 +125,16 @@ export default function MappingStep({ file, onSaved, onNext }) {
   }
 
   // Promote an unmapped input column (e.g. "Mood") into the master schema so its
-  // values are kept and saved, instead of being dropped. The server adds it to
-  // the master columns and wires it into this file's mapping.
-  async function addToMaster(header) {
+  // values are kept and saved, instead of being dropped. The server adds it as a
+  // REAL master_data column and wires it into this file's mapping. `name` is the
+  // (optionally edited) master column name confirmed in the dialog.
+  async function addToMaster(header, name) {
     setError("");
     setAdding(header);
     try {
       const updated = await api(`/api/files/${file.id}/columns`, {
         method: "POST",
-        body: { input_header: header },
+        body: { input_header: header, name: (name || header).trim() },
       });
       const entry = updated.mapping.find((m) => m.input_header === header);
       if (entry) {
@@ -140,6 +143,7 @@ export default function MappingStep({ file, onSaved, onNext }) {
       }
       onSaved(updated);
       setSaved(false);
+      setPendingCol(null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -391,7 +395,7 @@ export default function MappingStep({ file, onSaved, onNext }) {
                 <button
                   type="button"
                   className="btn small"
-                  onClick={() => addToMaster(h)}
+                  onClick={() => setPendingCol({ header: h, name: h })}
                   disabled={adding === h}
                 >
                   <Icon name="plus" size={13} />
@@ -399,6 +403,51 @@ export default function MappingStep({ file, onSaved, onNext }) {
                 </button>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {pendingCol && (
+        <div
+          className="save-overlay"
+          onClick={() => !adding && setPendingCol(null)}
+        >
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark">
+              <Icon name="plus" size={22} />
+            </div>
+            <h3>Add “{pendingCol.header}” to master data?</h3>
+            <p className="muted">
+              This becomes a permanent master column. Its values are saved to the
+              master data, exported like any other column, and reused to map future
+              files. Rename it below if needed.
+            </p>
+            <input
+              className="col-name-input"
+              value={pendingCol.name}
+              onChange={(e) =>
+                setPendingCol((p) => ({ ...p, name: e.target.value }))
+              }
+              placeholder="Master column name"
+              autoFocus
+            />
+            <div className="confirm-actions">
+              <button
+                className="btn sm"
+                onClick={() => setPendingCol(null)}
+                disabled={!!adding}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn sm primary"
+                onClick={() => addToMaster(pendingCol.header, pendingCol.name)}
+                disabled={!!adding || !pendingCol.name.trim()}
+              >
+                <Icon name="plus" size={15} />
+                {adding ? "Adding…" : "Add column"}
+              </button>
+            </div>
           </div>
         </div>
       )}
