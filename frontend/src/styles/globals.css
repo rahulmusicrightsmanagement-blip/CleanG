@@ -3037,6 +3037,22 @@ input::placeholder {
   gap: 0.6rem;
   margin-top: 1.2rem;
 }
+/* Editable master column name inside the "Add to master data" confirm dialog. */
+.col-name-input {
+  width: 100%;
+  margin-top: 0.9rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.col-name-input:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: var(--ring);
+}
 
 /* Unique-values side panel */
 .unique-overlay {

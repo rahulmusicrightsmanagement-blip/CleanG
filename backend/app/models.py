@@ -89,9 +89,13 @@ class MasterColumn(Base):
     position: Mapped[int] = mapped_column(Integer, unique=True)
     name: Mapped[str] = mapped_column(String(255))
     # True for columns a user added from an uploaded file (e.g. "Mood") that are
-    # not part of the seeded master format. Their values live in
-    # MasterData.extras (a JSON bag) rather than a dedicated typed column.
+    # not part of the seeded master format. Each is a REAL, dynamically-added
+    # column on `master_data`; `attr` holds its physical column name.
     custom: Mapped[bool] = mapped_column(default=False)
+    # Physical `master_data` column name for a custom column (snake_case, `x_`
+    # prefixed — see core.dynamic_columns.make_attr). NULL for built-in columns,
+    # which use the static MASTER_COLUMN_TO_ATTR map below.
+    attr: Mapped[str | None] = mapped_column(String(63), nullable=True)
 
 
 class UploadedFile(Base):
@@ -242,9 +246,8 @@ class MasterData(Base):
     lead_artist: Mapped[str] = mapped_column(String, default="")
     agreement_no: Mapped[str] = mapped_column(String, default="")
 
-    # Values for user-added custom columns (not in the fixed schema above),
-    # keyed by master column name: {"Mood": "Happy"}.
-    extras: Mapped[dict] = mapped_column(JSON, default=dict)
+    # User-added custom columns are REAL columns on this table, added at runtime
+    # (see core.dynamic_columns) and attached to this mapper — not a JSON bag.
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

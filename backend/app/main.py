@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from .config import get_settings
 from .core.csrf import csrf_protect
+from .core.dynamic_columns import make_attr, quote_ident, sync_custom_columns
 from .core.limiter import limiter
 from .core.scheduler import shutdown_scheduler, start_scheduler
 from .database import Base, SessionLocal, engine
@@ -67,19 +68,63 @@ def _migrate(db) -> None:
         "ALTER TABLE users "
         "ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE"
     ))
-    # Custom (user-added) master columns: a flag on the schema table + a JSON bag
-    # on each record to hold their values, for databases created before the feature.
+    # Custom (user-added) master columns: a flag + physical column name on the
+    # schema table. Their values are now REAL columns on master_data.
     db.execute(text(
         "ALTER TABLE master_columns "
         "ADD COLUMN IF NOT EXISTS custom BOOLEAN NOT NULL DEFAULT FALSE"
     ))
     db.execute(text(
-        "ALTER TABLE master_data "
-        "ADD COLUMN IF NOT EXISTS extras JSONB NOT NULL DEFAULT '{}'::jsonb"
+        "ALTER TABLE master_columns ADD COLUMN IF NOT EXISTS attr VARCHAR"
     ))
+    db.commit()
+    # Promote any legacy `extras` JSON values into real columns, then retire the
+    # bag entirely (idempotent: a no-op on databases without the legacy column).
+    _migrate_custom_columns(db)
+    db.execute(text("ALTER TABLE master_data DROP COLUMN IF EXISTS extras"))
     # Cleaned rows are no longer persisted — drop the legacy table so its stale
     # rows can't block file/branch deletion via the old foreign key.
     db.execute(text("DROP TABLE IF EXISTS cleaned_rows"))
+    db.commit()
+
+
+def _migrate_custom_columns(db) -> None:
+    """Back-fill custom columns from the legacy `master_data.extras` JSON bag into
+    dedicated real columns. Idempotent and safe on fresh databases.
+
+    For each custom master column: ensure it has a physical `attr`, add the real
+    column (metadata-only with its default), and copy any value that lived in the
+    `extras` bag into it. Identifiers are regex-validated and quoted.
+    """
+    has_extras = db.scalar(text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'master_data' AND column_name = 'extras'"
+    ))
+    rows = db.execute(text(
+        "SELECT id, name, attr FROM master_columns WHERE custom = TRUE"
+    )).all()
+    taken = {r.attr for r in rows if r.attr}
+    for r in rows:
+        attr = r.attr
+        if not attr:
+            attr = make_attr(r.name, taken)
+            taken.add(attr)
+            db.execute(
+                text("UPDATE master_columns SET attr = :a WHERE id = :i"),
+                {"a": attr, "i": r.id},
+            )
+        db.execute(text(
+            f"ALTER TABLE master_data ADD COLUMN IF NOT EXISTS "
+            f"{quote_ident(attr)} VARCHAR NOT NULL DEFAULT ''"
+        ))
+        if has_extras:
+            db.execute(
+                text(
+                    f"UPDATE master_data SET {quote_ident(attr)} = extras ->> :n "
+                    "WHERE extras ->> :n IS NOT NULL"
+                ),
+                {"n": r.name},
+            )
     db.commit()
 
 
@@ -104,6 +149,9 @@ def init_db() -> None:
             )
             db.commit()
         _seed_master_columns(db)
+        # Attach every custom column to the ORM mapper so this process can
+        # read/write them like built-ins from the first request.
+        sync_custom_columns(db)
     finally:
         db.close()
 

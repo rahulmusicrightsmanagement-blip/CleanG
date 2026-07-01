@@ -1,10 +1,11 @@
 import io
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, defer
 
 from ..config import get_settings
+from ..core.dynamic_columns import attach_custom_column, make_attr, quote_ident
 from ..core.excel import MAX_BYTES, ExcelValidationError, read_and_validate
 from ..core.limiter import limiter
 from ..core.matching import suggest_mapping
@@ -297,7 +298,29 @@ def add_master_column(
         )
         if column is None:
             next_pos = (db.scalar(select(func.max(MasterColumn.position))) or 0) + 1
-            column = MasterColumn(position=next_pos, name=name, custom=True)
+            # Register the column as a REAL, dynamically-added master_data column.
+            # `attr` is injection-proof (regex-validated + quoted); the ADD COLUMN
+            # is idempotent and, with a default, a fast metadata-only change on PG.
+            taken = set(
+                db.scalars(
+                    select(MasterColumn.attr).where(MasterColumn.attr.is_not(None))
+                )
+            )
+            attr = make_attr(name, taken)
+            try:
+                db.execute(
+                    text(
+                        f"ALTER TABLE master_data ADD COLUMN IF NOT EXISTS "
+                        f"{quote_ident(attr)} VARCHAR NOT NULL DEFAULT ''"
+                    )
+                )
+            except Exception:
+                db.rollback()
+                raise HTTPException(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "Could not add the column to the master data. Please try again.",
+                )
+            column = MasterColumn(position=next_pos, name=name, custom=True, attr=attr)
             db.add(column)
             db.flush()  # assign position/id before we reference it below
         master_col = column.name
@@ -329,4 +352,8 @@ def add_master_column(
     f.mapping = mapping
     db.commit()
     db.refresh(f)
+    # Once the column + its DDL are committed, make it visible to this process's
+    # ORM mapper so its values read/write like a built-in (idempotent).
+    if column is not None and column.custom and column.attr:
+        attach_custom_column(column.attr)
     return f
