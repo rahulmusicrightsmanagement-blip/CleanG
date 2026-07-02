@@ -24,8 +24,8 @@ REPORT_RECIPIENTS: list[str] = [
     "vishal@musicrightsmanagementindia.com",
 ]
 REPORT_ENABLED: bool = True
-REPORT_HOUR: int = 10            # 10:30 = 10:30 AM ...
-REPORT_MINUTE: int = 30
+REPORT_HOUR: int = 11            # 11:30 = 11:30 AM ...
+REPORT_MINUTE: int = 45
 REPORT_TIMEZONE: str = "Asia/Kolkata"  # ... India time
 # Gmail on port 587 uses STARTTLS (not implicit SSL).
 SMTP_USE_TLS: bool = True
