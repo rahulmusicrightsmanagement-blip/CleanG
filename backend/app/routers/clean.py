@@ -5,6 +5,8 @@ from collections import Counter
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import Font, PatternFill
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
 
@@ -785,6 +787,67 @@ def fill_column(
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# Review-sheet cell highlights (Excel "Bad/Neutral" palette, filter-safe fills).
+_FILL_EDITED = PatternFill("solid", fgColor="FFEB9C")  # yellow  -> human-corrected
+_FILL_ERROR = PatternFill("solid", fgColor="FFC7CE")   # red     -> unresolved error
+_HEADER_FONT = Font(bold=True)
+
+
+def _cell_review(r: "CleanRow") -> tuple[dict[str, str], dict[str, str], str]:
+    """Per-cell review annotations for one row.
+
+    Returns (edited, errored, issue_text):
+      - edited[col]   -> highlight the cell yellow; value is the resolved-issue note
+        ("'old' -> 'new'"). A human changed it (inline edit / artist merge / bulk fill).
+      - errored[col]  -> highlight the cell red; value is the error message.
+      - issue_text    -> one-line, per-column summary of what was resolved / is still
+        open, for the "Issue" column so a reviewer sees exactly what happened.
+    """
+    edited: dict[str, str] = {}
+    errored: dict[str, str] = {}
+    notes: list[str] = []
+    for i in r.issues:
+        col = i.get("column")
+        if not col:
+            continue
+        if i["action"] == "error":
+            msg = i.get("message") or i.get("tag") or "error"
+            errored[col] = msg
+            notes.append(f"{col}: {msg} (unresolved)")
+        elif i.get("tag") == "corrected":
+            old = i.get("original") or ""
+            new = i.get("value") or ""
+            edited[col] = f"'{old}' -> '{new}'"
+            notes.append(f"{col}: '{old}' -> '{new}' (manually corrected)")
+    return edited, errored, "; ".join(notes)
+
+
+def _write_review_sheet(ws, rows: list["CleanRow"], cols: list[str]) -> None:
+    """Second workbook sheet: the same rows as the export, but with every cell a
+    human touched highlighted yellow and every unresolved error highlighted red,
+    plus an "Issue" column spelling out precisely what was resolved per cell."""
+    header = ["Row", *cols, "Issue"]
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+    ws["1"][len(header) - 1].comment = Comment(
+        "Yellow = manually corrected by a reviewer (e.g. artist renamed/merged).\n"
+        "Red = error still unresolved.",
+        "Cleanser",
+    )
+    # 1-based column index of each data column (Row is col 1, data starts at col 2).
+    col_pos = {c: idx + 2 for idx, c in enumerate(cols)}
+    for r in rows:
+        edited, errored, issue_text = _cell_review(r)
+        ws.append([r.index + 1, *[r.values.get(c, "") for c in cols], issue_text])
+        row_no = ws.max_row
+        for col, pos in col_pos.items():
+            if col in errored:
+                ws.cell(row=row_no, column=pos).fill = _FILL_ERROR
+            elif col in edited:
+                ws.cell(row=row_no, column=pos).fill = _FILL_EDITED
+    ws.freeze_panes = "A2"
+
 
 @router.get("/api/files/{file_id}/export")
 @limiter.limit(settings.heavy_rate_limit)
@@ -817,6 +880,7 @@ def export_rows(
     cols = _active_columns(f)
 
     wb = Workbook()
+    # Sheet 1 — the plain export we already ship (unchanged).
     ws = wb.active
     ws.title = "Flagged rows" if view == "error" else "Rows"
     ws.append(["Row", *cols, "Issues"])
@@ -827,6 +891,10 @@ def export_rows(
             if i.get("action") == "error"
         )
         ws.append([r.index + 1, *[r.values.get(c, "") for c in cols], issues])
+
+    # Sheet 2 — same rows, but human-edited cells highlighted (yellow) and
+    # unresolved errors (red), with an Issue column, so the export can be reviewed.
+    _write_review_sheet(wb.create_sheet("Review (edits)"), rows, cols)
 
     buf = io.BytesIO()
     wb.save(buf)
