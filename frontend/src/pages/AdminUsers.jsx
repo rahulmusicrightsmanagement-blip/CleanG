@@ -1,16 +1,22 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client.js";
+import { useAuth } from "../context/AuthContext.jsx";
 import Icon from "../components/Icon.jsx";
 
 const EMPTY = { email: "", full_name: "", password: "", role: "user" };
 
 export default function AdminUsers() {
+  const { user: me } = useAuth();
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [form, setForm] = useState(EMPTY);
   const [busy, setBusy] = useState(false);
   const [showPw, setShowPw] = useState(false);
+  const [rowBusy, setRowBusy] = useState(null); // id of the user row being changed
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportMsg, setReportMsg] = useState("");
+  const [reportErr, setReportErr] = useState("");
 
   async function load() {
     setLoading(true);
@@ -31,6 +37,22 @@ export default function AdminUsers() {
     setForm((f) => ({ ...f, [field]: value }));
   }
 
+  async function sendReportNow() {
+    setReportBusy(true);
+    setReportMsg("");
+    setReportErr("");
+    try {
+      const res = await api("/api/reports/daily/send", { method: "POST" });
+      setReportMsg(
+        `Report sent for ${res.files} file(s) to ${res.recipients.join(", ")}.`
+      );
+    } catch (err) {
+      setReportErr(err.message);
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
   async function handleCreate(e) {
     e.preventDefault();
     setError("");
@@ -46,6 +68,41 @@ export default function AdminUsers() {
     }
   }
 
+  async function changeRole(id, role) {
+    setError("");
+    setRowBusy(id);
+    try {
+      const updated = await api(`/api/users/${id}`, {
+        method: "PATCH",
+        body: { role },
+      });
+      setUsers((prev) => prev.map((u) => (u.id === id ? updated : u)));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  async function removeUser(u) {
+    if (
+      !window.confirm(
+        `Delete ${u.full_name} (${u.email})? This permanently removes the account and cannot be undone.`
+      )
+    )
+      return;
+    setError("");
+    setRowBusy(u.id);
+    try {
+      await api(`/api/users/${u.id}`, { method: "DELETE" });
+      setUsers((prev) => prev.filter((x) => x.id !== u.id));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
   return (
     <section>
       <div className="page-head">
@@ -56,6 +113,25 @@ export default function AdminUsers() {
       </div>
 
       {error && <div className="alert">{error}</div>}
+
+      <div className="card create-form">
+        <h3>Daily report email</h3>
+        <p className="muted">
+          A summary of every uploaded &amp; cleaned data file is emailed
+          automatically each day at 10:30 (India time). Use this to send it now
+          for testing.
+        </p>
+        <button
+          className="btn"
+          type="button"
+          onClick={sendReportNow}
+          disabled={reportBusy}
+        >
+          {reportBusy ? "Sending…" : "Send report now"}
+        </button>
+        {reportMsg && <small className="muted" style={{ display: "block", marginTop: 8 }}>{reportMsg}</small>}
+        {reportErr && <div className="alert" style={{ marginTop: 8 }}>{reportErr}</div>}
+      </div>
 
       <form className="card create-form" onSubmit={handleCreate}>
         <h3>Create account</h3>
@@ -86,7 +162,7 @@ export default function AdminUsers() {
                 type={showPw ? "text" : "password"}
                 value={form.password}
                 onChange={(e) => update("password", e.target.value)}
-                minLength={12}
+                minLength={8}
                 required
               />
               <button
@@ -101,7 +177,7 @@ export default function AdminUsers() {
               </button>
             </span>
             <small className="muted">
-              Min 12 characters, with an uppercase letter, a lowercase letter and
+              Min 8 characters, with an uppercase letter, a lowercase letter and
               a digit.
             </small>
           </label>
@@ -131,19 +207,48 @@ export default function AdminUsers() {
               <th>Email</th>
               <th>Role</th>
               <th>Status</th>
+              <th style={{ textAlign: "right" }}>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {users.map((u) => (
-              <tr key={u.id}>
-                <td>{u.full_name}</td>
-                <td>{u.email}</td>
-                <td>
-                  <span className="role-pill">{u.role}</span>
-                </td>
-                <td>{u.is_active ? "Active" : "Disabled"}</td>
-              </tr>
-            ))}
+            {users.map((u) => {
+              const isSelf = me?.id === u.id;
+              return (
+                <tr key={u.id}>
+                  <td>{u.full_name}</td>
+                  <td>{u.email}</td>
+                  <td>
+                    <select
+                      value={u.role}
+                      disabled={isSelf || rowBusy === u.id}
+                      onChange={(e) => changeRole(u.id, e.target.value)}
+                      title={
+                        isSelf ? "You can't change your own role" : "Change role"
+                      }
+                    >
+                      <option value="user">User</option>
+                      <option value="admin">Admin</option>
+                    </select>
+                  </td>
+                  <td>{u.is_active ? "Active" : "Disabled"}</td>
+                  <td style={{ textAlign: "right" }}>
+                    <button
+                      type="button"
+                      className="btn danger sm"
+                      disabled={isSelf || rowBusy === u.id}
+                      onClick={() => removeUser(u)}
+                      title={
+                        isSelf
+                          ? "You can't delete your own account"
+                          : "Delete user"
+                      }
+                    >
+                      <Icon name="trash" size={15} /> Delete
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

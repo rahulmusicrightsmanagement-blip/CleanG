@@ -43,6 +43,7 @@
   --red-bg: #fef2f2;
   --blue: #2563eb;
   --blue-bg: #eff6ff;
+  --indigo: #6366f1; /* human-corrected cells (matches the "corrected" tag colour) */
   --purple: #7c3aed;
   --purple-bg: #f5f3ff;
 
@@ -92,6 +93,7 @@
   --blue-bg: #18283f;
   --purple: #b79af0;
   --purple-bg: #272042;
+  --indigo: #a5a8fb; /* human-corrected cells — lifted for contrast on dark */
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
   --shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.6);
@@ -316,6 +318,11 @@ input::placeholder {
   grid-template-columns: 1.05fr 1fr;
   background: var(--bg);
 }
+/* Standalone auth screens (e.g. forced password change) have no brand aside,
+   so render as a single centered column instead of an empty half. */
+.auth-shell.auth-solo {
+  grid-template-columns: 1fr;
+}
 
 /* Brand showcase */
 .auth-aside {
@@ -477,6 +484,10 @@ input::placeholder {
 .field-control input {
   width: 100%;
   padding: 0.72rem 0.85rem 0.72rem 2.5rem;
+}
+/* Leave room for the show/hide eye button so typed text never slides under it. */
+.field-control:has(.pw-toggle) input {
+  padding-right: 2.7rem;
 }
 .field-control:focus-within .field-icon {
   color: var(--brand);
@@ -1548,6 +1559,32 @@ input::placeholder {
   box-shadow: none;
 }
 
+.unused-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.unused-col {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.35rem 0.5rem 0.35rem 0.7rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.unused-name {
+  font-weight: 600;
+}
+
+.btn.small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  gap: 0.3rem;
+}
+
 /* ---------- Clean step ---------- */
 .clean-stats {
   display: grid;
@@ -1912,6 +1949,30 @@ input::placeholder {
 .grid-table thead .rownum {
   z-index: 3;
 }
+/* Excel-style frozen panes: the leading columns stay pinned while the rest of the
+   grid scrolls sideways. `left` is measured at runtime (widths are content-driven)
+   and set inline. Declared BEFORE the flagged/fixed cell rules so those — which
+   have the same specificity — keep their own tinted background when pinned. */
+.grid-table td.col-frozen {
+  position: sticky;
+  z-index: 1;
+  background: var(--surface);
+}
+.grid-table th.col-frozen {
+  position: sticky; /* still top: 0 from `.grid-table th` — sticks on both axes */
+  z-index: 4; /* above the other headers as they slide underneath */
+}
+/* Hairline marking where the frozen pane ends. */
+.grid-table .col-frozen-last::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-strong);
+  pointer-events: none;
+}
 .grid-table tr.row-err .rownum {
   color: var(--text);
   box-shadow: inset 3px 0 0 var(--amber);
@@ -1954,6 +2015,32 @@ input::placeholder {
 .orig-removed {
   color: var(--muted-2);
   text-decoration: line-through;
+}
+
+/* A cell a HUMAN changed (inline edit / bulk set / artist merge). Deliberately
+   louder than the tool's own green auto-fixes — a stronger wash plus a ring —
+   so the Manual Cleaned tab reads as "here is exactly what you touched". */
+.grid-table td.cell-manual {
+  background: color-mix(in srgb, var(--tag, var(--indigo)) 15%, #fff);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--tag, var(--indigo)) 45%, transparent);
+}
+/* Rows in the Manual Cleaned tab: an indigo spine so kept-as-is rows (which have
+   no changed cell to highlight) are still visibly reviewer-touched. */
+.grid-table tr.row-manual .rownum {
+  box-shadow: inset 3px 0 0 var(--indigo);
+}
+.row-kept {
+  display: inline-block;
+  margin-left: 0.3rem;
+  padding: 0 0.3rem;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--indigo);
+  background: color-mix(in srgb, var(--indigo) 12%, transparent);
+  vertical-align: 1px;
 }
 
 /* Legend above the grid */
@@ -2059,6 +2146,38 @@ input::placeholder {
   border-color: var(--green);
   color: var(--green);
 }
+/* "Send back to review" per-row button — same quiet outline, red on hover since
+   it undoes the manual clean and discards that row's edits. */
+.cell-revert {
+  margin-left: 0.4rem;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 5px;
+  padding: 0.1rem 0.25rem;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.cell-revert:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+/* "Delete row" per-row button — quiet outline, red on hover since it removes the
+   row from the file entirely. Available on any resting row, in every tab. */
+.cell-drop {
+  margin-left: 0.4rem;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 5px;
+  padding: 0.1rem 0.25rem;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.cell-drop:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
 
 /* Row selection */
 .row-check {
@@ -2094,12 +2213,85 @@ input::placeholder {
   padding: 0;
 }
 
+.checklist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.checklist-head .link-btn {
+  margin-left: 0;
+}
+
+/* Prev · numbered pages · Next — rendered above and below every long table. */
 .pager {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.75rem;
   justify-content: center;
-  margin-top: 1rem;
+  flex-wrap: wrap;
+  margin: 1rem 0;
+}
+.pager-size {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.pager-size select {
+  padding: 0.3rem 0.4rem;
+  font-size: 0.85rem;
+  width: auto;
+}
+.pager-pages {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+.pager-page {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.pager-page:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.pager-page.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.pager-page:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+/* The skipped-pages marker — use the "Go to" box to reach anything inside it. */
+.pager-gap {
+  padding: 0 0.15rem;
+  color: var(--muted-2);
+  user-select: none;
+}
+.pager-jump {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.pager-jump input {
+  width: 68px;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.85rem;
+}
+.pager-meta {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Sticky bar shown while there are unsaved inline edits. */
@@ -2640,6 +2832,26 @@ input::placeholder {
   user-select: none;
 }
 
+/* Build/version stamp — bottom-right of every page, stacked just above the
+   "Developed By" badge so the two don't overlap. */
+.version-badge {
+  position: fixed;
+  right: 12px;
+  bottom: 40px;
+  z-index: 80;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--muted-2);
+  background: var(--surface-glass);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+  user-select: none;
+}
+
 /* ============================================================
    Review — filters, column header menu, unique panel, modals
    ============================================================ */
@@ -2665,6 +2877,48 @@ input::placeholder {
 }
 .filter-btn {
   flex: none;
+}
+
+/* Tab-wide search box in the view bar — grows to fill the gap between the
+   tabs/filters on the left and the Download button on the right. */
+.grid-search {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex: 1 1 220px;
+  min-width: 180px;
+  max-width: 420px;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--surface, transparent);
+}
+.grid-search:focus-within {
+  border-color: var(--brand);
+}
+.grid-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  color: var(--text);
+  outline: none;
+}
+.grid-search-clear {
+  display: inline-grid;
+  place-items: center;
+  border: none;
+  background: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--muted);
+  border-radius: 6px;
+}
+.grid-search-clear:hover {
+  color: var(--text);
+  background: var(--hover, rgba(0, 0, 0, 0.06));
 }
 
 /* Filter toolbar + active-filter chips */
@@ -2992,6 +3246,22 @@ input::placeholder {
   gap: 0.6rem;
   margin-top: 1.2rem;
 }
+/* Editable master column name inside the "Add to master data" confirm dialog. */
+.col-name-input {
+  width: 100%;
+  margin-top: 0.9rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.col-name-input:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: var(--ring);
+}
 
 /* Unique-values side panel */
 .unique-overlay {
@@ -3098,6 +3368,7 @@ input::placeholder {
 }
 .unique-row {
   display: flex;
+  flex-direction: row;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
@@ -3119,6 +3390,8 @@ input::placeholder {
   color: var(--brand);
 }
 .unique-val {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3133,6 +3406,74 @@ input::placeholder {
   color: var(--muted);
   font-size: 0.74rem;
   font-weight: 700;
+}
+/* Normal-mode row is a wrapper: a big filter click-target plus a small ✦ that
+   opens the "find similar to merge" flow for that value. */
+.unique-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6rem;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.unique-similar-btn {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.unique-similar-btn:hover {
+  color: var(--brand);
+  border-color: var(--brand);
+}
+/* Similarity % badge in "find similar" mode. */
+.unique-ratio {
+  flex: none;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand) 14%, var(--surface));
+  color: var(--brand);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+.similar-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+.similar-strict {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.similar-strict select {
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 0.2rem 0.35rem;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  cursor: pointer;
 }
 .unique-foot {
   display: flex;
@@ -3496,4 +3837,86 @@ input::placeholder {
   height: 15px;
   border-width: 2px;
   margin: 0;
+}
+
+/* ---------- Export: master-data summary + read-only preview ---------- */
+.master-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.1;
+}
+.master-stat-num {
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: var(--brand);
+  letter-spacing: -0.02em;
+}
+.master-stat-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.preview-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+.download-preview-btn {
+  white-space: nowrap;
+}
+/* Horizontally + vertically scrollable, read-only grid. */
+.preview-table-wrap {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.preview-table {
+  margin: 0;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.preview-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--brand-50);
+  color: var(--brand-700);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+.preview-table td {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preview-table .preview-idx {
+  position: sticky;
+  left: 0;
+  background: var(--surface);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  width: 48px;
+  z-index: 1;
+}
+.preview-table thead .preview-idx {
+  z-index: 2;
+  background: var(--brand-50);
 }

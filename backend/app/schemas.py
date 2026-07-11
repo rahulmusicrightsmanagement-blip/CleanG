@@ -10,11 +10,11 @@ from .models import BranchStatus, FileStatus, UserRole
 ShortText = Annotated[str, Field(min_length=1, max_length=255)]
 LongText = Annotated[str, Field(max_length=2000)]
 
-_PASSWORD_MIN = 12
+_PASSWORD_MIN = 8
 
 
 def validate_password_strength(value: str) -> str:
-    """Reject weak passwords: >=12 chars with upper, lower and digit."""
+    """Reject weak passwords: >=8 chars with upper, lower and digit."""
     if len(value) < _PASSWORD_MIN:
         raise ValueError(f"Password must be at least {_PASSWORD_MIN} characters long.")
     if len(value) > 128:
@@ -123,6 +123,9 @@ class MasterColumnOut(BaseModel):
 
     position: int
     name: str
+    custom: bool = False
+    # Physical master_data column name for custom columns; None for built-ins.
+    attr: str | None = None
 
 
 class MasterDataPage(BaseModel):
@@ -190,6 +193,22 @@ class ExportRequest(BaseModel):
     sheet_name: Annotated[str, Field(max_length=100)] | None = None
 
 
+# The most rows one preview request may return. The master dataset is unbounded,
+# so "All" in the UI means "as many as this" — enough to scroll a whole branch's
+# worth of records, small enough that neither the query nor the browser stalls.
+PREVIEW_MAX_ROWS = 2000
+
+
+class PreviewRequest(BaseModel):
+    """A read-only, paginated look at the (optionally filtered) master data."""
+
+    filters: FilterMap = {}
+    # Columns to show; empty = every master column, in canonical order.
+    columns: Annotated[list[ShortText], Field(max_length=100)] = []
+    limit: Annotated[int, Field(ge=1, le=PREVIEW_MAX_ROWS)] = 50
+    offset: Annotated[int, Field(ge=0)] = 0
+
+
 class VerifyRequest(BaseModel):
     filters: FilterMap = {}
 
@@ -235,6 +254,7 @@ class FileOut(BaseModel):
     headers: list[str]
     mapping: list[MappingItem]
     warnings: list[str]
+    constants: dict[str, str] = {}
     status: FileStatus
     created_at: datetime
 
@@ -260,6 +280,19 @@ class MappingUpdate(BaseModel):
         dict[str, Annotated[list[ShortText], Field(max_length=100)]],
         Field(max_length=500),
     ] = {}
+
+
+class AddMasterColumn(BaseModel):
+    """Promote an unmapped input column into the master schema.
+
+    `input_header` is an existing header in the file; `name` is the master column
+    name to create (defaults to the header). The column is registered in the
+    master schema (as a custom column unless its name already exists) and wired
+    into this file's mapping so its values flow through to the master data.
+    """
+
+    input_header: ShortText
+    name: ShortText | None = None
 
 
 class PreviewOut(BaseModel):
@@ -302,6 +335,8 @@ class TagGroup(BaseModel):
 class CleanSummary(BaseModel):
     total: int
     clean: int
+    auto_clean: int = 0  # clean rows the tool fixed on its own
+    manual_clean: int = 0  # clean rows a reviewer edited or kept as-is
     errors: int
     auto_fixed: int  # number of cells auto-corrected
     tags: list[TagGroup]  # error types (needs review), grouped
@@ -352,12 +387,31 @@ class UniqueValuesOut(BaseModel):
     values: list[UniqueValue]  # most-common first, capped
 
 
+class SimilarValue(BaseModel):
+    value: str
+    count: int  # how many rows carry it
+    ratio: float  # 0..1 similarity to the queried value (1 = identical)
+
+
+class SimilarValuesOut(BaseModel):
+    """Distinct values of a column that closely resemble a queried value, ranked by
+    similarity. Powers the "find similar to merge" flow so a reviewer sees a value's
+    spelling variants (e.g. Shreya Ghosal / Ghoshal / Ghoshall) without scrolling."""
+
+    column: str
+    value: str  # the value the matches were compared against
+    matches: list[SimilarValue]  # most-similar first, capped
+
+
 class CleanRowOut(BaseModel):
     # Rows are computed in memory, identified by their position in the file.
     row_index: int
     status: str
     values: dict
     issues: list
+    # How a human moved this row into the clean set: "edited" (values changed),
+    # "kept" (accepted as-is), or None when the tool cleaned it on its own.
+    manual_kind: str | None = None
 
 
 class ReviewOut(BaseModel):
@@ -398,11 +452,34 @@ class RowsAccept(BaseModel):
     rows: Annotated[list[int], Field(max_length=1_000_000)] = []
 
 
+class RowsRevert(BaseModel):
+    """Undo the manual clean on rows: drop their "keep as-is" acceptance and any
+    reviewer corrections, so they fall back to Needs review. Empty `rows` +
+    `select_all=true` means: revert every row in the current filtered view."""
+
+    rows: Annotated[list[int], Field(max_length=1_000_000)] = []
+
+
+class RowsDrop(BaseModel):
+    """Remove rows from the file entirely: they're excluded from every tab, from
+    exports, and from the master save. Empty `rows` + `select_all=true` means:
+    remove every row in the current filtered view."""
+
+    rows: Annotated[list[int], Field(max_length=1_000_000)] = []
+
+
 class BulkFix(BaseModel):
     tag: str
     column: str | None = None
     action: str  # "set" | "drop"
     value: str | None = None
+
+
+class ColumnFill(BaseModel):
+    """Set (or clear, when blank) a whole-column constant. The value is broadcast
+    into every EMPTY cell of the column; an empty value removes the constant."""
+
+    value: Annotated[str, Field(max_length=2000)] = ""
 
 
 class ValueRemap(BaseModel):

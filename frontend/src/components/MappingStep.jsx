@@ -23,6 +23,9 @@ export default function MappingStep({ file, onSaved, onNext }) {
     )
   );
   const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState("");
+  // The new column awaiting confirmation: { header, name } while the modal is open.
+  const [pendingCol, setPendingCol] = useState(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(file.status === "mapped");
   const [query, setQuery] = useState("");
@@ -118,6 +121,33 @@ export default function MappingStep({ file, onSaved, onNext }) {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Promote an unmapped input column (e.g. "Mood") into the master schema so its
+  // values are kept and saved, instead of being dropped. The server adds it as a
+  // REAL master_data column and wires it into this file's mapping. `name` is the
+  // (optionally edited) master column name confirmed in the dialog.
+  async function addToMaster(header, name) {
+    setError("");
+    setAdding(header);
+    try {
+      const updated = await api(`/api/files/${file.id}/columns`, {
+        method: "POST",
+        body: { input_header: header, name: (name || header).trim() },
+      });
+      const entry = updated.mapping.find((m) => m.input_header === header);
+      if (entry) {
+        setChoices((c) => ({ ...c, [entry.master_column]: header }));
+        setExtras((e) => ({ ...e, [entry.master_column]: e[entry.master_column] || [] }));
+      }
+      onSaved(updated);
+      setSaved(false);
+      setPendingCol(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setAdding("");
     }
   }
 
@@ -353,11 +383,72 @@ export default function MappingStep({ file, onSaved, onNext }) {
 
       {trulyUnused.length > 0 && (
         <div className="card unused">
-          <strong>Unused input columns:</strong> {trulyUnused.join(", ")}
-          <p className="muted small" style={{ margin: "0.35rem 0 0" }}>
-            These exist in your file but have no place in the master format — they
-            won’t appear in the output.
+          <strong>New columns found</strong>
+          <p className="muted small" style={{ margin: "0.35rem 0 0.6rem" }}>
+            These exist in your file but aren’t part of the master format, so they
+            won’t be saved. Add any you want to keep to the master data.
           </p>
+          <div className="unused-list">
+            {trulyUnused.map((h) => (
+              <div key={h} className="unused-col">
+                <span className="unused-name">{h}</span>
+                <button
+                  type="button"
+                  className="btn small"
+                  onClick={() => setPendingCol({ header: h, name: h })}
+                  disabled={adding === h}
+                >
+                  <Icon name="plus" size={13} />
+                  {adding === h ? "Adding…" : "Add to master data"}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {pendingCol && (
+        <div
+          className="save-overlay"
+          onClick={() => !adding && setPendingCol(null)}
+        >
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark">
+              <Icon name="plus" size={22} />
+            </div>
+            <h3>Add “{pendingCol.header}” to master data?</h3>
+            <p className="muted">
+              This becomes a permanent master column. Its values are saved to the
+              master data, exported like any other column, and reused to map future
+              files. Rename it below if needed.
+            </p>
+            <input
+              className="col-name-input"
+              value={pendingCol.name}
+              onChange={(e) =>
+                setPendingCol((p) => ({ ...p, name: e.target.value }))
+              }
+              placeholder="Master column name"
+              autoFocus
+            />
+            <div className="confirm-actions">
+              <button
+                className="btn sm"
+                onClick={() => setPendingCol(null)}
+                disabled={!!adding}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn sm primary"
+                onClick={() => addToMaster(pendingCol.header, pendingCol.name)}
+                disabled={!!adding || !pendingCol.name.trim()}
+              >
+                <Icon name="plus" size={15} />
+                {adding ? "Adding…" : "Add column"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
