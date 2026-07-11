@@ -26,6 +26,7 @@ export default function App() {
 
   return (
     <>
+      <span className="version-badge">SKV2.4.2</span>
       <span className="made-by">Developed By Rahul and SK</span>
     <Routes>
       <Route
