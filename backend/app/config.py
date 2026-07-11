@@ -13,6 +13,24 @@ _PLACEHOLDER_SECRETS = {
     "12345678",
 }
 
+# --- Daily report: hardcoded settings (NOT environment-configurable) --------
+# Only the SMTP connection details live in .env; everything about WHEN the
+# report runs and WHO receives it is fixed here.
+REPORT_RECIPIENTS: list[str] = [
+    "rahul.musicrightsmanagement@gmail.com",
+    "swatantra.goongoonalo@gmail.com",
+    "sherley@musicrightsmanagementindia.com",
+    "devi@musicrightsmanagementindia.com",
+    "vishal@musicrightsmanagementindia.com",
+]
+REPORT_ENABLED: bool = True
+REPORT_HOUR: int = 11            # 11:30 = 11:30 AM ...
+REPORT_MINUTE: int = 45
+REPORT_TIMEZONE: str = "Asia/Kolkata"  # ... India time
+# Gmail on port 587 uses STARTTLS (not implicit SSL).
+SMTP_USE_TLS: bool = True
+SMTP_USE_SSL: bool = False
+
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment / .env file."""
@@ -64,6 +82,32 @@ class Settings(BaseSettings):
     # Host header allowlist (TrustedHostMiddleware). Comma-separated. Leave as "*"
     # to disable the check; set to your real hostnames in production.
     trusted_hosts: str = "*"
+
+    # --- SMTP for the daily report -----------------------------------------
+    # Only the SMTP connection details come from the environment (.env); the
+    # report recipients + schedule are hardcoded below. The digest is sent only
+    # when SMTP is fully configured; otherwise the scheduler logs a warning and
+    # skips (the app still boots normally).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_pass: str = ""
+    # Envelope/From header. Defaults to SMTP_USER when blank. May include a
+    # display name, e.g. "MRM Hub <rahul.musicrightsmanagement@gmail.com>".
+    smtp_from: str = ""
+
+    @property
+    def smtp_sender(self) -> str:
+        return self.smtp_from or self.smtp_user
+
+    @property
+    def report_recipient_list(self) -> list[str]:
+        return list(REPORT_RECIPIENTS)
+
+    @property
+    def smtp_configured(self) -> bool:
+        """True only when there is enough to actually send a mail."""
+        return bool(self.smtp_host and self.smtp_sender and REPORT_RECIPIENTS)
 
     @property
     def trusted_host_list(self) -> list[str]:

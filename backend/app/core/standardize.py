@@ -27,7 +27,7 @@ import re
 from openpyxl import load_workbook
 
 from ..models import MASTER_COLUMN_TO_ATTR
-from .cleaning import NAME_SEP, clean_value
+from .cleaning import NAME_SEP, clean_value, derive_lead_artist
 from .matching import SAMPLE_SIZE, _header_score, suggest_mapping
 
 # Standardize runs with NO human review, so it errs on the side of precision:
@@ -213,6 +213,9 @@ def standardize(headers: list[str], rows: list[list]) -> dict:
                 cell = r[i] if (i is not None and i < len(r)) else None
                 raws.append(_pre_normalize(col, cell))
             values[col] = clean_value(col, raws).value
+        # Roll Singer/Composer/Lyricist (and any existing value) up into Lead
+        # Artist, de-duplicated — every standardized row carries the full credit.
+        values["Lead Artist"] = derive_lead_artist(values)
         # Record # is positional: keep an input value, else number rows 1..N.
         if not values["Record #"]:
             values["Record #"] = str(n)

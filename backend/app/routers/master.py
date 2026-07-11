@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..core.audit import log_event
+from ..core.dynamic_columns import master_column_attrs
 from ..core.http import content_disposition
 from ..core.limiter import limiter
 from ..core.master_store import record_to_dict
@@ -37,6 +38,7 @@ from ..schemas import (
     FilterField,
     MasterColumnOut,
     MasterDataPage,
+    PreviewRequest,
     SuggestionOut,
     VerifyRequest,
     VerifyResult,
@@ -102,14 +104,15 @@ def _filtered_query(filters: dict[str, list[str]], user: User):
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _attr(col: str) -> str:
-    """Master column name -> MasterData attribute, or 422 if unknown."""
-    attr = MASTER_COLUMN_TO_ATTR.get(col)
-    if attr is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown column: {col!r}"
-        )
-    return attr
+def _custom_column_names(db: Session) -> list[str]:
+    """User-added custom column names, in schema order. Each has a real
+    master_data column (resolved via dynamic_columns.master_column_attrs) and is
+    read/exported exactly like a built-in column."""
+    return list(db.scalars(
+        select(MasterColumn.name)
+        .where(MasterColumn.custom.is_(True))
+        .order_by(MasterColumn.position)
+    ).all())
 
 settings = get_settings()
 router = APIRouter(prefix="/api/master", tags=["master"])
@@ -136,10 +139,18 @@ def master_data(
 ):
     """Extract stored master records, optionally projected to just the fields
     asked for — the structured table makes any field a cheap column read."""
+    # Built-in schema plus any user-added custom columns (real columns on
+    # master_data, resolved through the full name->attr map).
+    col_attr = master_column_attrs(db)
+    custom_cols = _custom_column_names(db)
+    known = list(MASTER_COLUMN_TO_ATTR) + [
+        c for c in custom_cols if c not in MASTER_COLUMN_TO_ATTR
+    ]
     columns = None
     if fields:
         wanted = [c.strip() for c in fields.split(",") if c.strip()]
-        columns = [c for c in wanted if c in MASTER_COLUMN_TO_ATTR]
+        columns = [c for c in wanted if c in known]
+    projection = columns or known
     total = _scoped_count(db, user)
     recs = db.scalars(
         _scope(select(MasterData), user)
@@ -148,8 +159,8 @@ def master_data(
         .limit(limit)
     ).all()
     return MasterDataPage(
-        columns=columns or list(MASTER_COLUMN_TO_ATTR),
-        rows=[record_to_dict(r, columns) for r in recs],
+        columns=projection,
+        rows=[record_to_dict(r, projection, col_attr) for r in recs],
         total=total,
     )
 
@@ -161,11 +172,28 @@ def export_options(
 ):
     """Everything the Export tab needs: presets (with their appendable custom
     columns), the full column list for a fully-custom export, and the fields the
-    user can pre-filter on."""
+    user can pre-filter on.
+
+    User-added custom columns (real master_data columns) are folded in too: they
+    extend the fully-custom column list AND become appendable extras on every
+    preset (PDL / SVF), so any column captured at upload can be exported alongside
+    the built-in schema."""
     total = _scoped_count(db, user)
+    custom_cols = _custom_column_names(db)
+    all_columns = list(ALL_COLUMNS) + [c for c in custom_cols if c not in ALL_COLUMNS]
+    presets = []
+    for p in preset_payload():
+        appendable = list(p["custom_columns"]) + [
+            c for c in custom_cols
+            if c not in p["columns"] and c not in p["custom_columns"]
+        ]
+        presets.append(ExportPreset(
+            key=p["key"], label=p["label"], columns=p["columns"],
+            custom_columns=appendable,
+        ))
     return ExportOptions(
-        presets=[ExportPreset(**p) for p in preset_payload()],
-        all_columns=list(ALL_COLUMNS),
+        presets=presets,
+        all_columns=all_columns,
         filter_fields=[
             FilterField(key=label, label=label, columns=cols)
             for label, cols in FILTER_FIELDS
@@ -219,6 +247,38 @@ def suggest_values(
     # Most common spelling first — it's the one the user most likely wants.
     out.sort(key=lambda s: (-s.count, s.value.lower()))
     return out
+
+
+@router.post("/preview", response_model=MasterDataPage)
+def preview_master(
+    payload: PreviewRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """A read-only, paginated view of the (optionally filtered) master data.
+
+    Same filtering semantics as export, but returns rows as JSON for on-screen
+    display instead of streaming an xlsx. Purely a read — nothing is modified."""
+    col_attr = master_column_attrs(db)
+    if payload.columns:
+        cols = [c for c in payload.columns if c in col_attr]
+    else:
+        cols = list(MASTER_COLUMN_TO_ATTR)
+    if not cols:
+        cols = list(MASTER_COLUMN_TO_ATTR)
+
+    base = _filtered_query(payload.filters, user)
+    total = db.scalar(
+        select(func.count()).select_from(base.subquery())
+    ) or 0
+    recs = db.scalars(
+        base.order_by(MasterData.id).offset(payload.offset).limit(payload.limit)
+    ).all()
+    return MasterDataPage(
+        columns=cols,
+        rows=[record_to_dict(r, cols, col_attr) for r in recs],
+        total=total,
+    )
 
 
 @router.post("/verify", response_model=VerifyResult)
@@ -288,16 +348,28 @@ def export_master(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one column to export."
         )
-    # Validate + resolve every requested column up front.
-    cols = [(c, _attr(c)) for c in payload.columns]
+    # Validate + resolve every requested column up front. Built-in and custom
+    # columns alike read from a real MasterData attribute; anything else is rejected.
+    col_attr = master_column_attrs(db)
+    cols: list[tuple[str, str]] = []  # (column, attr)
+    for c in payload.columns:
+        attr = col_attr.get(c)
+        if attr is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown column: {c!r}"
+            )
+        cols.append((c, attr))
     stmt = _filtered_query(payload.filters, user).order_by(MasterData.id)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = (payload.sheet_name or "Master data")[:31]
+    # write_only + yield_per streams records straight to the .xlsx zip instead of
+    # materialising a styled cell object per value and every ORM row at once, so an
+    # export of the full master dataset (100k+ rows) completes in seconds with a few
+    # MB of memory rather than timing out / exhausting RAM.
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet((payload.sheet_name or "Master data")[:31])
     ws.append([c for c, _ in cols])
     n = 0
-    for rec in db.scalars(stmt):
+    for rec in db.scalars(stmt.execution_options(yield_per=1000)):
         ws.append([getattr(rec, attr) or "" for _, attr in cols])
         n += 1
 

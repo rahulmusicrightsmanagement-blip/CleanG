@@ -1,3 +1,4 @@
+import difflib
 import io
 import json
 from collections import Counter
@@ -5,6 +6,9 @@ from collections import Counter
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.comments import Comment
+from openpyxl.styles import Font, PatternFill
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer
 
@@ -40,6 +44,7 @@ from ..schemas import (
     BulkFix,
     CleanRowOut,
     CleanSummary,
+    ColumnFill,
     ColumnProfile,
     CommitRequest,
     CommitResult,
@@ -50,6 +55,10 @@ from ..schemas import (
     RowEdit,
     RowsAccept,
     RowsBatchEdit,
+    RowsDrop,
+    RowsRevert,
+    SimilarValue,
+    SimilarValuesOut,
     TagGroup,
     UniqueValue,
     UniqueValuesOut,
@@ -95,7 +104,25 @@ def _get_file_or_404(file_id: int, user: User, db: Session) -> UploadedFile:
 
 
 def _active_columns(f: UploadedFile) -> list[str]:
-    return [m["master_column"] for m in f.mapping if m.get("input_header")]
+    active = {m["master_column"] for m in f.mapping if m.get("input_header")}
+    # Columns given a constant fill are output columns even with no input source.
+    active |= set(f.constants or {})
+    # Lead Artist is auto-derived from Singer/Composer/Lyricist, so it's a real
+    # output column whenever any contributing credit (or Lead Artist) is present.
+    if active & {"Singer", "Composer", "Lyricist", "Lead Artist"}:
+        active.add("Lead Artist")
+    # Canonical master columns first, in schema order so derived/filled columns
+    # slot into their natural position; user-added custom columns (not part of the
+    # fixed schema, e.g. "Mood") follow, in the order their mapping rows appear.
+    canonical = [c for c in MASTER_COLUMN_TO_ATTR if c in active]
+    custom = [
+        m["master_column"]
+        for m in f.mapping
+        if m["master_column"] in active
+        and m["master_column"] not in MASTER_COLUMN_TO_ATTR
+    ]
+    seen = set(canonical)
+    return canonical + [c for c in custom if not (c in seen or seen.add(c))]
 
 
 def _is_name_column(col: str) -> bool:
@@ -134,13 +161,17 @@ _CACHE_LIMIT = 16
 def _signature(f: UploadedFile) -> str:
     # `data` is immutable after upload, so only the overlay + mapping vary.
     return json.dumps(
-        [f.mapping, f.corrections or {}, f.dropped or [], f.accepted or []],
+        [
+            f.mapping, f.corrections or {}, f.dropped or [],
+            f.accepted or [], f.constants or {},
+        ],
         sort_keys=True, default=str,
     )
 
 
 def _mark_corrected(
-    base_values: dict, cleaned: dict, issues: list[dict], override: dict
+    base_values: dict, cleaned: dict, issues: list[dict], override: dict,
+    merged_cols: set | None = None,
 ) -> list[dict]:
     """Flag every cell a human changed (merge / inline edit / bulk set) so the
     Review grid highlights it as "Manually corrected".
@@ -150,7 +181,12 @@ def _mark_corrected(
     `original`, so hovering shows what it was. Cells still in error keep their
     error flag (it already highlights and explains the problem); any cosmetic
     auto-fix flag on a corrected cell is superseded by this stronger marker.
+
+    `merged_cols` are the columns on this row whose value came from a value-merge
+    (remap) rather than a typed edit — those get the distinct "merged" tag so they
+    can be filtered as "Merged value", separate from hand corrections.
     """
+    merged_cols = merged_cols or set()
     edited = {
         col for col in override
         if (cleaned.get(col) or "") != (base_values.get(col) or "")
@@ -162,16 +198,36 @@ def _mark_corrected(
     for col in edited:
         if col in err_cols:
             continue
+        is_merge = col in merged_cols
         kept.append({
             "column": col,
             "action": "fixed",
-            "tag": "corrected",
-            "message": "Manually corrected in review.",
+            "tag": "merged" if is_merge else "corrected",
+            "message": "Merged value in review." if is_merge
+            else "Manually corrected in review.",
             "value": cleaned.get(col, ""),
             "original": base_values.get(col, ""),
             "cosmetic": False,
         })
     return kept
+
+
+def _merged_cols(f: UploadedFile, idx: int) -> set:
+    """Columns on row `idx` whose correction came from a value-merge (remap)."""
+    return set((f.merged_cells or {}).get(str(idx), {}).keys())
+
+
+def _forget_merged(merged: dict, row_index: int, cols) -> None:
+    """A later hand edit or revert supersedes a merge on these cells — drop their
+    merge-origin marks in place so they stop showing as "Merged value"."""
+    key = str(row_index)
+    row = merged.get(key)
+    if not row:
+        return
+    for c in cols:
+        row.pop(c, None)
+    if not row:
+        merged.pop(key, None)
 
 
 def _entry(f: UploadedFile) -> dict:
@@ -181,7 +237,7 @@ def _entry(f: UploadedFile) -> dict:
     if hit and hit["sig"] == sig:
         return hit
 
-    base = clean_dataset(f.data, f.headers, f.mapping)
+    base = clean_dataset(f.data, f.headers, f.mapping, f.constants or {})
     corrections = f.corrections or {}
     dropped = set(f.dropped or [])
     accepted = set(f.accepted or [])
@@ -193,7 +249,9 @@ def _entry(f: UploadedFile) -> dict:
         override = corrections.get(str(r.index))
         if override:
             cleaned, issues = revalidate({**r.values, **override})
-            issues = _mark_corrected(r.values, cleaned, issues, override)
+            issues = _mark_corrected(
+                r.values, cleaned, issues, override, _merged_cols(f, r.index)
+            )
             r = CleanRow(index=r.index, values=cleaned, issues=issues)
         rows.append(r)
 
@@ -208,9 +266,78 @@ def _entry(f: UploadedFile) -> dict:
 
     if len(_CACHE) >= _CACHE_LIMIT:
         _CACHE.pop(next(iter(_CACHE)))
-    entry = {"sig": sig, "rows": rows, "summary": None, "profile": None}
+    # `base_values` is the pre-overlay cleaned value dict for EVERY data row (keyed
+    # by original index). It lets a later single/batch edit or artist merge re-clean
+    # only the changed rows (see _edit_in_place) instead of re-cleaning the whole
+    # file — captured before mark_duplicates, which only touches issues, not values.
+    entry = {
+        "sig": sig,
+        "rows": rows,
+        "summary": None,
+        "profile": None,
+        "base_values": {r.index: r.values for r in base},
+    }
     _CACHE[f.id] = entry
     return entry
+
+
+def _warm_base_values(f: UploadedFile) -> dict | None:
+    """The cached per-row base values if the file's clean cache is warm, else None.
+
+    Warm access means an edit can validate its row index and recompute in place
+    without loading the (large, possibly remote) `data` blob at all."""
+    e = _CACHE.get(f.id)
+    if e and e.get("base_values") is not None:
+        return e["base_values"]
+    return None
+
+
+def _edit_in_place(f: UploadedFile, changed: set[int]) -> bool:
+    """Recompute only the `changed` rows in the warm cache after their corrections
+    were updated (written, or removed by a revert), instead of re-cleaning the
+    entire file.
+
+    Returns False if the cache is cold or in an unexpected state, so the caller
+    falls back to a full invalidate + rebuild — always correct, just slower. This
+    is the hot path for inline edits and artist merges on large files: it avoids
+    both the ~1s whole-file re-clean and the multi-MB data-blob reload from the
+    (remote) database that a full rebuild would trigger on the next request.
+    """
+    if not changed:
+        return True  # nothing to recompute; the warm cache is already consistent
+    entry = _CACHE.get(f.id)
+    if not entry or entry.get("base_values") is None:
+        return False
+    base_values: dict = entry["base_values"]
+    corrections = f.corrections or {}
+    dropped = set(f.dropped or [])
+    accepted = set(f.accepted or [])
+    rows: list[CleanRow] = entry["rows"]
+    pos = {r.index: k for k, r in enumerate(rows)}
+
+    for idx in changed:
+        bv = base_values.get(idx)
+        # A revert clears the row's override, so a missing one is expected there;
+        # the row simply re-cleans back to its pre-review values. A row that's
+        # absent or dropped is unexpected -> bail to the safe full-rebuild path.
+        if bv is None or idx in dropped or idx not in pos:
+            return False
+        override = corrections.get(str(idx)) or {}
+        cleaned, issues = revalidate({**bv, **override})
+        issues = _mark_corrected(bv, cleaned, issues, override, _merged_cols(f, idx))
+        rows[pos[idx]] = CleanRow(index=idx, values=cleaned, issues=issues)
+
+    # An edit can change cross-row duplicate flags; re-run the cheap (no-DB) pass.
+    mark_duplicates(rows)
+    # Preserve the "keep as-is" decisions (accepted rows keep their errors cleared).
+    if accepted:
+        for r in rows:
+            if r.index in accepted:
+                r.issues = [i for i in r.issues if i["action"] != "error"]
+    entry["sig"] = _signature(f)
+    entry["summary"] = None
+    entry["profile"] = None
+    return True
 
 
 def build_rows(f: UploadedFile) -> list[CleanRow]:
@@ -257,9 +384,41 @@ def _accept_in_place(f: UploadedFile) -> None:
     entry["profile"] = None
 
 
-def _row_out(r: CleanRow) -> CleanRowOut:
+def _row_key(key: object) -> int | None:
+    """A `corrections` dict key as a row index, or None when it isn't one."""
+    try:
+        return int(key)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _manual_kinds(f: UploadedFile) -> dict[int, str]:
+    """row_index -> how a human moved that row into the clean set.
+
+    "edited" — the reviewer changed cell values (inline edit, bulk set, or an
+    artist merge), stored as a correction.
+    "kept"   — the reviewer hit "keep as-is", clearing the row's error flags
+    without touching any value.
+
+    A row that was both edited and accepted reports "edited" (the stronger,
+    more informative signal). Rows absent from this map were cleaned entirely by
+    the tool — the "Auto cleaned" tab.
+    """
+    kinds: dict[int, str] = {i: "kept" for i in (f.accepted or [])}
+    for key in (f.corrections or {}):
+        idx = _row_key(key)
+        if idx is not None:
+            kinds[idx] = "edited"
+    return kinds
+
+
+def _row_out(r: CleanRow, manual_kind: str | None = None) -> CleanRowOut:
     return CleanRowOut(
-        row_index=r.index, status=r.status, values=r.values, issues=r.issues
+        row_index=r.index,
+        status=r.status,
+        values=r.values,
+        issues=r.issues,
+        manual_kind=manual_kind,
     )
 
 
@@ -273,16 +432,18 @@ def _review_payload(
     tags: list[str] | None = None,
     sort: str | None = None,
     direction: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    value_filters: dict[str, list[str]] | None = None,
+    query: str | None = None,
 ) -> "ReviewOut":
     """Build the full Review payload (summary + profile + page of rows). Shared by
     GET /review and the edit/accept mutations so they each return in one trip.
 
-    Optional `tags` (match ANY), `contains_col`/`contains_val` (value filter) and
-    `sort`/`direction` are applied server-side so they hold across pages."""
+    Optional `tags` (match ANY), `value_filters` (per-column value filters, AND'd
+    across columns), `query` (tab-wide text search) and `sort`/`direction` are
+    applied server-side so they hold across pages."""
     rows = build_rows(f)
-    filtered = _filter_rows(rows, view, tag, tags, contains_col, contains_val)
+    manual = _manual_kinds(f)
+    filtered = _filter_rows(rows, view, tag, tags, value_filters, manual, query)
     filtered = _sort_rows(filtered, sort, direction)
     total = len(filtered)
     page = max(0, page)
@@ -290,7 +451,7 @@ def _review_payload(
     return ReviewOut(
         summary=_get_summary(f),
         profile=_get_profile(f) if include_profile else None,
-        rows=[_row_out(r) for r in page_rows],
+        rows=[_row_out(r, manual.get(r.index)) for r in page_rows],
         total=total,
         page=page,
         page_size=page_size,
@@ -300,11 +461,15 @@ def _review_payload(
 def _summary(f: UploadedFile, rows: list[CleanRow]) -> CleanSummary:
     tags: Counter = Counter()
     fix_tags: Counter = Counter()
+    manual = _manual_kinds(f)
     auto_fixed = 0
     clean = 0
+    manual_clean = 0
     for r in rows:
         if r.status == "clean":
             clean += 1
+            if r.index in manual:
+                manual_clean += 1
         for i in r.issues:
             if i["action"] == "error":
                 tags[i["tag"]] += 1
@@ -314,6 +479,8 @@ def _summary(f: UploadedFile, rows: list[CleanRow]) -> CleanSummary:
     return CleanSummary(
         total=len(rows),
         clean=clean,
+        auto_clean=clean - manual_clean,
+        manual_clean=manual_clean,
         errors=len(rows) - clean,
         auto_fixed=auto_fixed,
         tags=[
@@ -478,28 +645,91 @@ def _build_profile(columns: list[str], rows: list[CleanRow]) -> DataProfile:
     )
 
 
+def _parse_value_filters(raw: str | None) -> dict[str, list[str]]:
+    """Parse the `filters` query param — JSON like {"UPC": ["256"], "Label": ["svf"]}
+    — into a {column: [values]} map. Within a column the values match ANY (OR);
+    across columns a row must satisfy EVERY column (AND). Malformed input is treated
+    as no filter so a bad param never 500s the grid."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for col, vals in data.items():
+        if not isinstance(col, str):
+            continue
+        if isinstance(vals, str):
+            vals = [vals]
+        if not isinstance(vals, (list, tuple)):
+            continue
+        clean = [str(v) for v in vals if str(v).strip() != ""]
+        if clean:
+            out[col] = clean
+    return out
+
+
 def _filter_rows(
     rows: list[CleanRow],
     view: str | None,
     tag: str | None,
     tags: list[str] | None = None,
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    value_filters: dict[str, list[str]] | None = None,
+    manual: dict[int, str] | None = None,
+    query: str | None = None,
 ) -> list[CleanRow]:
+    """Narrow the cleaned rows to one Review tab, then apply the tag/value filters.
+
+    Views: all · error (needs review) · clean (both clean tabs) ·
+    auto_clean (clean with no human touch) · manual_clean (a reviewer edited the
+    row or kept it as-is, sending it into the clean set).
+
+    `value_filters` is a {column: [values]} map from the unique-values panels:
+    values ANY-match within a column (OR), and every listed column must match (AND),
+    so "UPC = 256" and "Label = svf" narrow the grid together instead of replacing
+    one another.
+
+    `query` is the tab-wide search box: keep a row when ANY of its cell values
+    contains the text (case-insensitive substring), so a value copied from the grid
+    finds its row in whichever tab is open."""
     if view in ("clean", "error"):
         rows = [r for r in rows if r.status == view]
+    elif view in ("auto_clean", "manual_clean"):
+        touched = manual or {}
+        want_manual = view == "manual_clean"
+        rows = [
+            r for r in rows
+            if r.status == "clean" and ((r.index in touched) == want_manual)
+        ]
     if tag:
         rows = [r for r in rows if any(i.get("tag") == tag for i in r.issues)]
     if tags:
         wanted = set(tags)
         rows = [r for r in rows if any(i.get("tag") in wanted for i in r.issues)]
-    if contains_col and contains_val:
-        target = contains_val.strip().lower()
-        rows = [
-            r for r in rows
-            if any(p.lower() == target for p in _value_pieces(contains_col, r.values.get(contains_col, "")))
-            or target in (r.values.get(contains_col, "") or "").lower()
-        ]
+    if value_filters:
+        # Exact-value filters picked from each column's unique-values panel: match
+        # the whole cell (or one exact piped piece for name fields) — never a
+        # substring, or picking UPC "256" would also drag in "12564". Each column
+        # narrows the set in turn (AND); its values match ANY (OR).
+        for col, vals in value_filters.items():
+            targets = {v.strip().lower() for v in vals}
+            rows = [
+                r for r in rows
+                if any(
+                    p.lower() in targets
+                    for p in _value_pieces(col, r.values.get(col, ""))
+                )
+            ]
+    if query:
+        needle = query.strip().lower()
+        if needle:
+            rows = [
+                r for r in rows
+                if any(needle in (v or "").lower() for v in r.values.values())
+            ]
     return rows
 
 
@@ -539,8 +769,8 @@ def review(
     tags: str | None = None,
     sort: str | None = None,
     dir: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    filters: str | None = None,
+    q: str | None = None,
     page: int = 0,
     page_size: int = 50,
     include_profile: bool = True,
@@ -551,8 +781,9 @@ def review(
     profile, and the requested page of rows (filtered by view/tag).
 
     `tags` is a comma-joined list of cleaning/error tags (match ANY);
-    `contains_col`/`contains_val` filter by a column value; `sort`/`dir` order
-    the rows. All apply server-side so they hold across pages.
+    `filters` is a JSON {column: [values]} map of value filters (AND'd across
+    columns); `sort`/`dir` order the rows. All apply server-side so they hold
+    across pages.
 
     Cleaning is computed once and memoised, so this is a single fast call no
     matter how the user pages or filters — and the big row blob is read at most
@@ -561,7 +792,7 @@ def review(
     return _review_payload(
         f, view, tag, page, page_size, include_profile,
         tags=_split_csv(tags), sort=sort, direction=dir,
-        contains_col=contains_col, contains_val=contains_val,
+        value_filters=_parse_value_filters(filters), query=q,
     )
 
 
@@ -588,16 +819,22 @@ def clean_rows(
 _UNIQUE_CAP = 1000  # bound the side-panel payload for very high-cardinality columns
 
 
-@router.get("/api/files/{file_id}/columns/{column}/unique", response_model=UniqueValuesOut)
+@router.get("/api/files/{file_id}/columns/unique", response_model=UniqueValuesOut)
 def column_unique_values(
     file_id: int,
     column: str,
+    q: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """The distinct values of one column (most-common first), pipe-split for name
     fields so each individual singer/composer is counted separately. Powers the
-    per-column "Show unique values" side panel. Runs over the cached rows."""
+    per-column "Show unique values" side panel. Runs over the cached rows.
+
+    `q` narrows to values containing that substring (case-insensitive). The search
+    runs over the FULL value set BEFORE the display cap, so a specific value copied
+    from the grid is always found — even in a very high-cardinality column (e.g. a
+    UPC) where it would otherwise fall outside the top `_UNIQUE_CAP` by count."""
     f = _get_file_or_404(file_id, user, db)
     if column not in _active_columns(f):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Column not found")
@@ -605,10 +842,93 @@ def column_unique_values(
     for r in build_rows(f):
         for piece in _value_pieces(column, r.values.get(column, "")):
             counts[piece] += 1
+    needle = (q or "").strip().lower()
+    if needle:
+        matched = [(v, n) for v, n in counts.items() if needle in v.lower()]
+        total_distinct = len(matched)
+        # Sort the matches most-common first, then cap the payload.
+        top = sorted(matched, key=lambda vn: (-vn[1], vn[0]))[:_UNIQUE_CAP]
+    else:
+        total_distinct = len(counts)
+        top = counts.most_common(_UNIQUE_CAP)
     return UniqueValuesOut(
         column=column,
-        total_distinct=len(counts),
-        values=[UniqueValue(value=v, count=n) for v, n in counts.most_common(_UNIQUE_CAP)],
+        total_distinct=total_distinct,
+        values=[UniqueValue(value=v, count=n) for v, n in top],
+    )
+
+
+def _token_sorted(s: str) -> str:
+    """Words re-ordered alphabetically, so word-order variants of the same name
+    ("Kumar Sanu" vs "Sanu Kumar") still compare as near-identical."""
+    return " ".join(sorted(s.split()))
+
+
+def _similarity(a: str, b: str) -> float:
+    """0..1 resemblance of two already-normalized strings. Uses the character
+    ratio, and — for multi-word values — the stronger of that and a token-sorted
+    ratio, so a swapped word order doesn't tank the score."""
+    direct = difflib.SequenceMatcher(None, a, b).ratio()
+    if " " in a or " " in b:
+        return max(direct, difflib.SequenceMatcher(None, _token_sorted(a), _token_sorted(b)).ratio())
+    return direct
+
+
+@router.get("/api/files/{file_id}/columns/similar", response_model=SimilarValuesOut)
+def column_similar_values(
+    file_id: int,
+    column: str,
+    value: str,
+    min_ratio: float = 0.7,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Distinct values of `column` that closely resemble `value`, ranked by
+    similarity (most-similar first). Powers the "find similar to merge" flow: pick a
+    value and the panel surfaces just its likely spelling variants (e.g. Shreya
+    Ghosal / Ghoshal / Ghoshall), so the reviewer merges an accurate cluster instead
+    of hunting through the whole list.
+
+    `min_ratio` is the similarity floor (0..1). Values that normalize identically to
+    `value` are omitted — merging them would be a no-op."""
+    f = _get_file_or_404(file_id, user, db)
+    if column not in _active_columns(f):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Column not found")
+    base = _dedup_norm(value)
+    if not base:
+        return SimilarValuesOut(column=column, value=value, matches=[])
+    threshold = min(max(min_ratio, 0.0), 1.0)
+
+    counts: Counter = Counter()
+    for r in build_rows(f):
+        for piece in _value_pieces(column, r.values.get(column, "")):
+            counts[piece] += 1
+
+    multi = " " in base
+    base_sorted = _token_sorted(base) if multi else base
+    sm = difflib.SequenceMatcher(None, "", base, autojunk=False)
+    matches: list[tuple[str, int, float]] = []
+    for v, n in counts.items():
+        nv = _dedup_norm(v)
+        if not nv or nv == base:
+            continue  # identical once normalized -> nothing to merge
+        sm.set_seq1(nv)
+        # real_quick_ratio is a cheap upper bound: skip clear non-matches fast.
+        ratio = sm.ratio() if sm.real_quick_ratio() >= threshold else 0.0
+        if multi:
+            ratio = max(
+                ratio,
+                difflib.SequenceMatcher(None, _token_sorted(nv), base_sorted).ratio(),
+            )
+        if ratio >= threshold:
+            matches.append((v, n, ratio))
+
+    matches.sort(key=lambda x: (-x[2], -x[1], x[0]))
+    matches = matches[:_UNIQUE_CAP]
+    return SimilarValuesOut(
+        column=column,
+        value=value,
+        matches=[SimilarValue(value=v, count=n, ratio=round(r, 4)) for v, n, r in matches],
     )
 
 
@@ -645,7 +965,7 @@ def _remap_alias(payload: ValueRemap) -> dict[str, str]:
 
 
 @router.post(
-    "/api/files/{file_id}/columns/{column}/remap/preview", response_model=RemapPreview
+    "/api/files/{file_id}/columns/remap/preview", response_model=RemapPreview
 )
 def remap_preview(
     file_id: int,
@@ -670,7 +990,7 @@ def remap_preview(
     return RemapPreview(affected_rows=affected)
 
 
-@router.post("/api/files/{file_id}/columns/{column}/remap", response_model=ReviewOut)
+@router.post("/api/files/{file_id}/columns/remap", response_model=ReviewOut)
 def remap_column_value(
     file_id: int,
     column: str,
@@ -680,8 +1000,8 @@ def remap_column_value(
     tags: str | None = None,
     sort: str | None = None,
     dir: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    filters: str | None = None,
+    q: str | None = None,
     page: int = 0,
     page_size: int = 50,
     include_profile: bool = True,
@@ -701,6 +1021,8 @@ def remap_column_value(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Nothing to remap.")
 
     corrections = dict(f.corrections or {})
+    merged = {k: dict(v) for k, v in (f.merged_cells or {}).items()}
+    changed: set[int] = set()
     for r in build_rows(f):
         cur = r.values.get(column, "")
         new = _remap_cell(column, cur, alias)
@@ -708,17 +1030,157 @@ def remap_column_value(
             override = dict(corrections.get(str(r.index), {}))
             override[column] = new
             corrections[str(r.index)] = override
+            merged.setdefault(str(r.index), {})[column] = True
+            changed.add(r.index)
     f.corrections = corrections
+    f.merged_cells = merged
+    db.commit()
+    # Recompute only the rows the merge rewrote; full rebuild only if cache is cold.
+    if not _edit_in_place(f, changed):
+        _invalidate(file_id)
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        value_filters=_parse_value_filters(filters), query=q,
+    )
+
+
+@router.post("/api/files/{file_id}/columns/fill", response_model=ReviewOut)
+def fill_column(
+    file_id: int,
+    column: str,
+    payload: ColumnFill,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    filters: str | None = None,
+    q: str | None = None,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Set a whole-column constant that fills every EMPTY cell of `column` with the
+    given value — existing values are never overwritten. A blank value clears the
+    constant. The column becomes an output column even if no input feeds it, so a
+    batch-wide value (e.g. Revenue Share / Revenue Split) can be added in one go.
+    Returns the refreshed Review payload."""
+    f = _get_file_or_404(file_id, user, db)
+    if column not in MASTER_COLUMN_TO_ATTR:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown master column.")
+
+    constants = dict(f.constants or {})
+    value = payload.value.strip()
+    if value:
+        constants[column] = payload.value
+    else:
+        constants.pop(column, None)
+    f.constants = constants
     db.commit()
     _invalidate(file_id)
     return _review_payload(
         f, view, tag, page, page_size, include_profile,
         tags=_split_csv(tags), sort=sort, direction=dir,
-        contains_col=contains_col, contains_val=contains_val,
+        value_filters=_parse_value_filters(filters), query=q,
     )
 
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# Sheet 1's name mirrors the Review tab the download came from.
+_SHEET_NAMES = {
+    "error": "Flagged rows",
+    "auto_clean": "Auto cleaned",
+    "manual_clean": "Manual cleaned",
+    "clean": "Clean rows",
+    "all": "Rows",
+}
+
+# Review-sheet cell highlights (Excel "Bad/Neutral" palette, filter-safe fills).
+_FILL_EDITED = PatternFill("solid", fgColor="FFEB9C")  # yellow  -> human-corrected
+_FILL_ERROR = PatternFill("solid", fgColor="FFC7CE")   # red     -> unresolved error
+_HEADER_FONT = Font(bold=True)
+
+
+def _cell_review(r: "CleanRow", manual_kind: str | None = None) -> tuple[dict[str, str], dict[str, str], str]:
+    """Per-cell review annotations for one row.
+
+    Returns (edited, errored, issue_text):
+      - edited[col]   -> highlight the cell yellow; value is the resolved-issue note
+        ("'old' -> 'new'"). A human changed it (inline edit / artist merge / bulk fill).
+      - errored[col]  -> highlight the cell red; value is the error message.
+      - issue_text    -> one-line, per-column summary of what was resolved / is still
+        open, for the "Issue" column so a reviewer sees exactly what happened.
+
+    `manual_kind` ("edited" / "kept") comes from the reviewer's actions, so a row
+    kept as-is is called out even though none of its cells changed.
+    """
+    edited: dict[str, str] = {}
+    errored: dict[str, str] = {}
+    notes: list[str] = []
+    for i in r.issues:
+        col = i.get("column")
+        if not col:
+            continue
+        if i["action"] == "error":
+            msg = i.get("message") or i.get("tag") or "error"
+            errored[col] = msg
+            notes.append(f"{col}: {msg} (unresolved)")
+        elif i.get("tag") in ("corrected", "merged"):
+            old = i.get("original") or ""
+            new = i.get("value") or ""
+            edited[col] = f"'{old}' -> '{new}'"
+            kind = "merged value" if i.get("tag") == "merged" else "manually corrected"
+            notes.append(f"{col}: '{old}' -> '{new}' ({kind})")
+    if manual_kind == "kept" and not notes:
+        notes.append("Kept as-is by a reviewer (values unchanged)")
+    return edited, errored, "; ".join(notes)
+
+
+def _write_review_sheet(
+    ws,
+    rows: list["CleanRow"],
+    cols: list[str],
+    manual: dict[int, str] | None = None,
+) -> None:
+    """Second workbook sheet: the same rows as the export, but with every cell a
+    human touched highlighted yellow and every unresolved error highlighted red,
+    plus an "Issue" column spelling out precisely what was resolved per cell.
+
+    Streamed via a write-only worksheet (`ws` from a write_only Workbook) so even a
+    six-figure-row file is produced in seconds with a few MB of memory — styled
+    cells are `WriteOnlyCell`s built inline (random-access `ws.cell()` is not
+    available in write-only mode)."""
+    manual = manual or {}
+    ws.freeze_panes = "A2"  # write-only: must be set before the first append
+    header = []
+    for value in ("Row", *cols, "Issue"):
+        cell = WriteOnlyCell(ws, value=value)
+        cell.font = _HEADER_FONT
+        header.append(cell)
+    header[-1].comment = Comment(
+        "Yellow = manually corrected by a reviewer (e.g. artist renamed/merged).\n"
+        "Red = error still unresolved.",
+        "Cleanser",
+    )
+    ws.append(header)
+    for r in rows:
+        edited, errored, issue_text = _cell_review(r, manual.get(r.index))
+        line = [r.index + 1]
+        for col in cols:
+            value = r.values.get(col, "")
+            fill = _FILL_ERROR if col in errored else _FILL_EDITED if col in edited else None
+            if fill is not None:
+                cell = WriteOnlyCell(ws, value=value)
+                cell.fill = fill
+                line.append(cell)
+            else:
+                line.append(value)  # plain value -> no per-cell object overhead
+        line.append(issue_text)
+        ws.append(line)
 
 
 @router.get("/api/files/{file_id}/export")
@@ -731,8 +1193,8 @@ def export_rows(
     tags: str | None = None,
     sort: str | None = None,
     dir: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    filters: str | None = None,
+    q: str | None = None,
     filename: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -741,19 +1203,27 @@ def export_rows(
 
     Honors the exact same view/tag/tags/sort/value-filter the Review grid is
     showing, so "download" gives the user the very set of rows in front of them
-    (e.g. all rows sorted by Singer descending, or only rows containing one
-    singer). The sheet is built in memory and streamed — nothing hits disk.
+    (e.g. all rows sorted by Singer descending, or only the manually cleaned
+    rows). Every tab exports the same two sheets: a plain one, and a review sheet
+    where each cell a human changed is highlighted. The workbook is built in
+    memory and streamed — nothing hits disk.
     """
     f = _get_file_or_404(file_id, user, db)
+    manual = _manual_kinds(f)
+    value_filters = _parse_value_filters(filters)
     rows = _filter_rows(
-        build_rows(f), view, tag, _split_csv(tags), contains_col, contains_val
+        build_rows(f), view, tag, _split_csv(tags), value_filters, manual, q
     )
     rows = _sort_rows(rows, sort, dir)
     cols = _active_columns(f)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Flagged rows" if view == "error" else "Rows"
+    # write_only streams rows straight to the zip: a 15k-row export drops from
+    # ~60s / ~130 MB (the default Workbook builds a styled object per cell, which
+    # blew past the 60s proxy timeout — the reported "can't download") to ~3s / a
+    # few MB, and scales to six-figure row counts well under any gateway timeout.
+    wb = Workbook(write_only=True)
+    # Sheet 1 — the plain export we already ship.
+    ws = wb.create_sheet(_SHEET_NAMES.get(view, "Rows"))
     ws.append(["Row", *cols, "Issues"])
     for r in rows:
         issues = "; ".join(
@@ -762,6 +1232,10 @@ def export_rows(
             if i.get("action") == "error"
         )
         ws.append([r.index + 1, *[r.values.get(c, "") for c in cols], issues])
+
+    # Sheet 2 — same rows, but human-edited cells highlighted (yellow) and
+    # unresolved errors (red), with an Issue column, so the export can be reviewed.
+    _write_review_sheet(wb.create_sheet("Review (edits)"), rows, cols, manual)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -777,8 +1251,10 @@ def export_rows(
         parts = ["flagged_rows" if view == "error" else f"{view}_rows"]
         if sort:
             parts.append(f"by_{sort}_{dir}")
-        if contains_col and contains_val:
-            parts.append(f"{contains_col}_{contains_val}")
+        for col, vals in value_filters.items():
+            parts.append(f"{col}_{'_'.join(vals)}")
+        if q and q.strip():
+            parts.append(f"search_{q.strip()}")
         out_name = safe_filename("_".join(parts) + f"_file{file_id}.xlsx")
     return StreamingResponse(
         buf,
@@ -797,7 +1273,13 @@ def edit_row(
 ):
     """Human edit: store the changed cells as a correction and re-clean the row."""
     f = _get_file_or_404(file_id, user, db)
-    if not (0 <= row_index < len(f.data)):
+    # Bounds-check against the warm cache (all row indices) when possible, so a
+    # single edit doesn't force a reload of the whole data blob just to read len().
+    base_values = _warm_base_values(f)
+    if base_values is not None:
+        if row_index not in base_values:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Row not found")
+    elif not (0 <= row_index < len(f.data)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Row not found")
 
     corrections = dict(f.corrections or {})
@@ -805,8 +1287,15 @@ def edit_row(
     existing.update(payload.values)
     corrections[str(row_index)] = existing
     f.corrections = corrections
+    # A typed edit on a previously-merged cell supersedes the merge origin.
+    if f.merged_cells:
+        merged = {k: dict(v) for k, v in f.merged_cells.items()}
+        _forget_merged(merged, row_index, payload.values.keys())
+        f.merged_cells = merged
     db.commit()
-    _invalidate(file_id)
+    # Recompute just this row in place; fall back to a full rebuild if cache is cold.
+    if not _edit_in_place(f, {row_index}):
+        _invalidate(file_id)
 
     for r in build_rows(f):
         if r.index == row_index:
@@ -823,8 +1312,8 @@ def edit_rows(
     tags: str | None = None,
     sort: str | None = None,
     dir: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    filters: str | None = None,
+    q: str | None = None,
     page: int = 0,
     page_size: int = 50,
     include_profile: bool = True,
@@ -839,24 +1328,40 @@ def edit_rows(
     """
     f = _get_file_or_404(file_id, user, db)
     corrections = dict(f.corrections or {})
-    n = len(f.data)
+    # Validate indices against the warm cache when possible (avoids loading the
+    # data blob just to read its length); fall back to len(data) if cache is cold.
+    base_values = _warm_base_values(f)
+    n = len(base_values) if base_values is not None else len(f.data)
+    merged = {k: dict(v) for k, v in f.merged_cells.items()} if f.merged_cells else None
+    changed: set[int] = set()
     for idx_str, values in payload.edits.items():
         try:
             idx = int(idx_str)
         except (TypeError, ValueError):
             continue
-        if not (0 <= idx < n):
+        if base_values is not None:
+            if idx not in base_values:
+                continue
+        elif not (0 <= idx < n):
             continue
         existing = dict(corrections.get(idx_str, {}))
         existing.update(values)
         corrections[idx_str] = existing
+        changed.add(idx)
+        # A typed edit on a previously-merged cell supersedes the merge origin.
+        if merged is not None:
+            _forget_merged(merged, idx, values.keys())
     f.corrections = corrections
+    if merged is not None:
+        f.merged_cells = merged
     db.commit()
-    _invalidate(file_id)
+    # Recompute only the edited rows in place; full rebuild only if cache is cold.
+    if not _edit_in_place(f, changed):
+        _invalidate(file_id)
     return _review_payload(
         f, view, tag, page, page_size, include_profile,
         tags=_split_csv(tags), sort=sort, direction=dir,
-        contains_col=contains_col, contains_val=contains_val,
+        value_filters=_parse_value_filters(filters), query=q,
     )
 
 
@@ -869,8 +1374,8 @@ def accept_rows(
     tags: str | None = None,
     sort: str | None = None,
     dir: str = "asc",
-    contains_col: str | None = None,
-    contains_val: str | None = None,
+    filters: str | None = None,
+    q: str | None = None,
     page: int = 0,
     page_size: int = 50,
     include_profile: bool = True,
@@ -896,7 +1401,132 @@ def accept_rows(
     return _review_payload(
         f, view, tag, page, page_size, include_profile,
         tags=_split_csv(tags), sort=sort, direction=dir,
-        contains_col=contains_col, contains_val=contains_val,
+        value_filters=_parse_value_filters(filters), query=q,
+    )
+
+
+@router.post("/api/files/{file_id}/revert", response_model=ReviewOut)
+def revert_rows(
+    file_id: int,
+    payload: RowsRevert,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    filters: str | None = None,
+    q: str | None = None,
+    select_all: bool = False,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Send manually-cleaned rows back to Needs review — the inverse of /accept.
+
+    Drops each row's "keep as-is" acceptance AND its reviewer corrections, so the
+    row re-cleans from its original values and its error flags come back. A row
+    whose original values were already clean simply returns to the Auto cleaned
+    tab. Rows the tool cleaned on its own are ignored (nothing to undo).
+
+    `select_all=true` reverts every manually-cleaned row in the current filtered
+    view instead of the explicit `rows` list."""
+    f = _get_file_or_404(file_id, user, db)
+    manual = _manual_kinds(f)
+    if select_all:
+        targets = {
+            r.index
+            for r in _filter_rows(
+                build_rows(f), view, tag, _split_csv(tags),
+                _parse_value_filters(filters), manual, q,
+            )
+            if r.index in manual
+        }
+    else:
+        targets = {i for i in payload.rows if i in manual}
+
+    if targets:
+        f.accepted = [i for i in (f.accepted or []) if i not in targets]
+        f.corrections = {
+            k: v for k, v in (f.corrections or {}).items()
+            if _row_key(k) not in targets
+        }
+        # Reverting a row re-cleans it from scratch — forget any merge origin too.
+        if f.merged_cells:
+            f.merged_cells = {
+                k: v for k, v in f.merged_cells.items()
+                if _row_key(k) not in targets
+            }
+        db.commit()
+        # Re-clean only the reverted rows in the warm cache; the values change, so
+        # this can't use the cheaper _accept_in_place path.
+        if not _edit_in_place(f, targets):
+            _invalidate(file_id)
+
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        value_filters=_parse_value_filters(filters), query=q,
+    )
+
+
+@router.post("/api/files/{file_id}/drop", response_model=ReviewOut)
+def drop_rows(
+    file_id: int,
+    payload: RowsDrop,
+    view: str = "all",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    filters: str | None = None,
+    q: str | None = None,
+    select_all: bool = False,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Remove rows from the file entirely — the reviewer's explicit delete.
+
+    A dropped row is excluded from every review tab, from exports, and from the
+    master save (it never reaches the master dataset). Works in ANY tab and on any
+    row, so a reviewer can weed out unwanted records — e.g. filter to a value, then
+    delete the whole matching set.
+
+    `select_all=true` deletes every row in the current filtered view (honoring the
+    active view/tag/tags/value-filters/search) instead of the explicit `rows` list,
+    so a filter-then-delete removes exactly what's on screen across all pages."""
+    f = _get_file_or_404(file_id, user, db)
+    if select_all:
+        targets = {
+            r.index
+            for r in _filter_rows(
+                build_rows(f), view, tag, _split_csv(tags),
+                _parse_value_filters(filters), _manual_kinds(f), q,
+            )
+        }
+    else:
+        # Bound to the file's real rows so a stale/oob index can't poison `dropped`.
+        base = _warm_base_values(f)
+        n = len(base) if base is not None else len(f.data)
+        targets = {i for i in payload.rows if 0 <= i < n}
+
+    if targets:
+        dropped = set(f.dropped or [])
+        dropped.update(targets)
+        f.dropped = sorted(dropped)
+        db.commit()
+        # Removing rows changes the row set (and cross-row duplicate flags), which
+        # the in-place fast paths can't express — rebuild from the new signature.
+        _invalidate(file_id)
+
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        value_filters=_parse_value_filters(filters), query=q,
     )
 
 

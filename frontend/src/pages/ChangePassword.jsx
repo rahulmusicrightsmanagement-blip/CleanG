@@ -5,7 +5,7 @@ import Icon from "../components/Icon.jsx";
 // Client-side mirror of the server's password policy so the user gets instant
 // feedback (the server re-validates regardless — this is UX, not the gate).
 const RULES = [
-  { test: (v) => v.length >= 12, label: "At least 12 characters" },
+  { test: (v) => v.length >= 8, label: "At least 8 characters" },
   { test: (v) => /[a-z]/.test(v), label: "A lowercase letter" },
   { test: (v) => /[A-Z]/.test(v), label: "An uppercase letter" },
   { test: (v) => /\d/.test(v), label: "A digit" },
@@ -20,6 +20,9 @@ export default function ChangePassword({ forced = false }) {
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [show, setShow] = useState({ current: false, next: false, confirm: false });
+
+  const toggle = (k) => setShow((s) => ({ ...s, [k]: !s[k] }));
 
   const failed = RULES.filter((r) => !r.test(next));
   const mismatch = confirm.length > 0 && confirm !== next;
@@ -41,8 +44,8 @@ export default function ChangePassword({ forced = false }) {
   }
 
   return (
-    <div className="auth-shell">
-      <main className="auth-panel" style={{ margin: "0 auto" }}>
+    <div className="auth-shell auth-solo">
+      <main className="auth-panel">
         <form className="auth-form" onSubmit={handleSubmit}>
           <div className="auth-brand auth-brand-sm">
             <img src="/logo.png" alt="MRM Cleanser" className="brand-logo" />
@@ -69,7 +72,7 @@ export default function ChangePassword({ forced = false }) {
             <span className="field-control">
               <Icon name="lock" size={17} className="field-icon" />
               <input
-                type="password"
+                type={show.current ? "text" : "password"}
                 value={current}
                 onChange={(e) => setCurrent(e.target.value)}
                 autoComplete="current-password"
@@ -77,6 +80,16 @@ export default function ChangePassword({ forced = false }) {
                 required
                 autoFocus
               />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => toggle("current")}
+                aria-label={show.current ? "Hide password" : "Show password"}
+                title={show.current ? "Hide password" : "Show password"}
+                tabIndex={-1}
+              >
+                <Icon name={show.current ? "eyeOff" : "eye"} size={18} />
+              </button>
             </span>
           </label>
 
@@ -85,13 +98,23 @@ export default function ChangePassword({ forced = false }) {
             <span className="field-control">
               <Icon name="lock" size={17} className="field-icon" />
               <input
-                type="password"
+                type={show.next ? "text" : "password"}
                 value={next}
                 onChange={(e) => setNext(e.target.value)}
                 autoComplete="new-password"
                 placeholder="••••••••"
                 required
               />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => toggle("next")}
+                aria-label={show.next ? "Hide password" : "Show password"}
+                title={show.next ? "Hide password" : "Show password"}
+                tabIndex={-1}
+              >
+                <Icon name={show.next ? "eyeOff" : "eye"} size={18} />
+              </button>
             </span>
           </label>
 
@@ -100,13 +123,23 @@ export default function ChangePassword({ forced = false }) {
             <span className="field-control">
               <Icon name="lock" size={17} className="field-icon" />
               <input
-                type="password"
+                type={show.confirm ? "text" : "password"}
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}
                 autoComplete="new-password"
                 placeholder="••••••••"
                 required
               />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => toggle("confirm")}
+                aria-label={show.confirm ? "Hide password" : "Show password"}
+                title={show.confirm ? "Hide password" : "Show password"}
+                tabIndex={-1}
+              >
+                <Icon name={show.confirm ? "eyeOff" : "eye"} size={18} />
+              </button>
             </span>
             {mismatch && (
               <span className="caps-hint">

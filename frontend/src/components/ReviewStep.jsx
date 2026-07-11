@@ -2,8 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, download } from "../api/client.js";
 import Icon from "./Icon.jsx";
+import Pager, { effectivePageSize } from "./Pager.jsx";
 
-const PAGE_SIZE = 50;
+// Excel-style frozen panes: the row number plus this many leading columns stay
+// pinned while the rest of the grid scrolls sideways.
+const FROZEN_COLS = 5;
+// …unless they'd eat the viewport. Never pin more than this share of the grid's
+// visible width, or there'd be nothing left to scroll.
+const FROZEN_MAX_SHARE = 0.6;
 
 // A distinct colour per error type so the grid, chips and captions all agree —
 // you can tell at a glance which kind of problem each red cell is.
@@ -33,20 +39,68 @@ const TAG_COLORS = {
   standardized_category: "#16a34a",
   normalized_language: "#10b981",
   normalized_percent: "#06b6d4",
-  // Human change (merge / inline edit / bulk set) — distinct indigo so a cell you
+  combined_columns: "#0ea5e9",
+  derived_lead_artist: "#0284c7",
+  filled_constant: "#0369a1",
+  // Human change (inline edit / bulk set) — distinct indigo so a cell you
   // manipulated stands out from the tool's own green auto-fixes.
   corrected: "#6366f1",
+  // Value-merge (remap) — a violet sibling of `corrected`: still a human change,
+  // but filterable on its own as "Merged value".
+  merged: "#8b5cf6",
 };
 const tagColor = (t) => TAG_COLORS[t] || "#6b7280";
+
+// Each tab names its own download, so a folder of exports is self-explanatory —
+// e.g. "Demo(manual_cleaned_singer_desc).xlsx".
+const VIEW_SLUG = {
+  all: "all_rows",
+  error: "needs_review",
+  auto_clean: "auto_cleaned",
+  manual_clean: "manual_cleaned",
+};
+
+/**
+ * Where each frozen column has to be pinned, measured off the live header row.
+ * Column widths are content-driven, so the offsets can't be known up front: the
+ * Nth pinned column sits at the summed width of the row-number cell and every
+ * pinned column before it.
+ *
+ * Returns one left-offset per pinned column — fewer than FROZEN_COLS (or none)
+ * when pinning them all would leave too little of the grid scrollable.
+ */
+function measureFrozen(scrollEl) {
+  const cells = scrollEl.querySelector("thead tr")?.children;
+  if (!cells || cells.length < 2) return [];
+  const budget = scrollEl.clientWidth * FROZEN_MAX_SHARE;
+  const lefts = [];
+  let left = cells[0].offsetWidth; // the sticky row-number column
+  const last = Math.min(FROZEN_COLS, cells.length - 1);
+  for (let i = 1; i <= last; i++) {
+    const w = cells[i].offsetWidth;
+    if (left + w > budget) break;
+    lefts.push(left);
+    left += w;
+  }
+  return lefts;
+}
+
+// The empty-grid line, per tab.
+const EMPTY_TEXT = {
+  error: "Nothing left to review here 🎉",
+  auto_clean: "No rows were cleaned automatically.",
+  manual_clean: "No rows cleaned manually yet — fix or keep a flagged row and it lands here.",
+};
 
 export default function ReviewStep({ file, onCommitted }) {
   const [summary, setSummary] = useState(null);
   const [profile, setProfile] = useState(null);
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
-  const [view, setView] = useState("all"); // all | error | clean
+  const [view, setView] = useState("all"); // all | error | auto_clean | manual_clean
   const [activeTag, setActiveTag] = useState(null);
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50); // 0 = All
   const [drafts, setDrafts] = useState({}); // rowIndex -> {col: value}
   const [bulkValue, setBulkValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -64,12 +118,20 @@ export default function ReviewStep({ file, onCommitted }) {
   const [activeTags, setActiveTags] = useState([]); // applied fix-tag filters
   const [sortCol, setSortCol] = useState("");
   const [sortDir, setSortDir] = useState("asc");
-  const [containsCol, setContainsCol] = useState(""); // "show unique" value filter
-  const [containsVal, setContainsVal] = useState("");
+  // Per-column value filters picked from the "show unique" panels: { col: [values] }.
+  // Values match ANY within a column (OR); columns are AND'd together, so
+  // UPC "256" and Label "svf" narrow the grid at the same time.
+  const [valueFilters, setValueFilters] = useState({});
   // Draft selections inside the open filter modal (committed on "Apply filter").
   const [draftTags, setDraftTags] = useState([]);
   const [draftSortCol, setDraftSortCol] = useState("");
   const [draftSortDir, setDraftSortDir] = useState("asc");
+
+  // --- Fill a column with a constant value (empties only) ---
+  const [showFill, setShowFill] = useState(false);
+  const [fillCol, setFillCol] = useState("");
+  const [fillVal, setFillVal] = useState("");
+  const [fillBusy, setFillBusy] = useState(false);
 
   // --- Column header interactions ---
   const [headerMenuCol, setHeaderMenuCol] = useState(null); // open popover column
@@ -82,9 +144,15 @@ export default function ReviewStep({ file, onCommitted }) {
   const [uniqueCol, setUniqueCol] = useState(null);
   const [uniqueValues, setUniqueValues] = useState([]);
   const [uniqueLoading, setUniqueLoading] = useState(false);
-  const [uniqueSearch, setUniqueSearch] = useState("");
+  const [uniqueSearch, setUniqueSearch] = useState(""); // what the user is typing
+  const [uniqueSearchQ, setUniqueSearchQ] = useState(""); // debounced, sent to server
+  const [uniqueNonce, setUniqueNonce] = useState(0); // bump to force a re-fetch
   const [uniqueSortKey, setUniqueSortKey] = useState("count"); // count | value
   const [uniqueSortDir, setUniqueSortDir] = useState("desc"); // asc | desc
+
+  // --- Tab-wide grid search (works in every view tab) ---
+  const [search, setSearch] = useState(""); // what the user is typing
+  const [searchQ, setSearchQ] = useState(""); // debounced, sent to server
 
   // --- Merge values (alias a variant into a canonical value) ---
   const [mergeMode, setMergeMode] = useState(false); // checkboxes shown in panel
@@ -93,14 +161,30 @@ export default function ReviewStep({ file, onCommitted }) {
   const [mergeBusy, setMergeBusy] = useState(false);
   const [mergeConfirm, setMergeConfirm] = useState(null); // {from:[], to, count}
 
+  // --- "Find similar to merge": similarity-assisted variant discovery ---
+  const [similarBase, setSimilarBase] = useState(null); // value we're clustering around
+  const [similarMatches, setSimilarMatches] = useState([]); // [{value,count,ratio}]
+  const [similarLoading, setSimilarLoading] = useState(false);
+  const [similarRatio, setSimilarRatio] = useState(0.9); // strictness (0.9/0.8/0.7)
+
   // --- Synced horizontal scrollbar shown above the grid ---
   const gridScrollRef = useRef(null);
   const topScrollRef = useRef(null);
   const [gridWidth, setGridWidth] = useState(0);
   const [hasXOverflow, setHasXOverflow] = useState(false); // grid wider than viewport
 
+  // Left offsets (px) for the frozen leading columns, measured from the rendered
+  // header. Its length is how many columns are actually pinned.
+  const [frozenLefts, setFrozenLefts] = useState([]);
+
   // --- Save confirmation ---
   const [showSaveConfirm, setShowSaveConfirm] = useState(false);
+
+  // --- Send manually-cleaned rows back to "Needs review" ---
+  const [revertConfirm, setRevertConfirm] = useState(null); // {rows, all, count}
+
+  // --- Delete rows from the file (any tab) ---
+  const [dropConfirm, setDropConfirm] = useState(null); // {rows, all, count}
 
   // --- Near-duplicate review (cleaned row vs. an existing master record) ---
   const [checkingConflicts, setCheckingConflicts] = useState(false);
@@ -110,11 +194,19 @@ export default function ReviewStep({ file, onCommitted }) {
 
   // Headers come straight from the mapping we already have, so the grid frame
   // renders instantly instead of waiting on the network.
-  const columns = useMemo(
-    () =>
-      (file.mapping || [])
-        .filter((m) => m.input_header)
-        .map((m) => m.master_column),
+  const columns = useMemo(() => {
+    // The server reports the authoritative output columns (mapped + auto-derived
+    // Lead Artist + any constant-filled columns) in canonical master order. Fall
+    // back to the mapping for the very first paint, before the summary arrives.
+    if (summary?.columns?.length) return summary.columns;
+    return (file.mapping || [])
+      .filter((m) => m.input_header)
+      .map((m) => m.master_column);
+  }, [file.mapping, summary]);
+
+  // Every master column (mapped or not) — the pick list for "Add column value".
+  const allMasterColumns = useMemo(
+    () => (file.mapping || []).map((m) => m.master_column),
     [file.mapping]
   );
 
@@ -156,7 +248,9 @@ export default function ReviewStep({ file, onCommitted }) {
     return m;
   }, [profile]);
 
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  // "All" has no page size of its own — ask for more rows than any file holds.
+  const apiPageSize = effectivePageSize(pageSize);
+  const pages = Math.max(1, Math.ceil(total / apiPageSize));
 
   // Shared query string so GET /review and the edit/accept mutations all target
   // the same view/tag/page — letting mutations return the refreshed grid in one
@@ -166,7 +260,7 @@ export default function ReviewStep({ file, onCommitted }) {
       const qs = new URLSearchParams({
         view,
         page: String(page),
-        page_size: String(PAGE_SIZE),
+        page_size: String(apiPageSize),
         include_profile: String(withProfile),
       });
       if (activeTag) qs.set("tag", activeTag);
@@ -175,13 +269,13 @@ export default function ReviewStep({ file, onCommitted }) {
         qs.set("sort", sortCol);
         qs.set("dir", sortDir);
       }
-      if (containsCol && containsVal) {
-        qs.set("contains_col", containsCol);
-        qs.set("contains_val", containsVal);
+      if (Object.keys(valueFilters).length) {
+        qs.set("filters", JSON.stringify(valueFilters));
       }
+      if (searchQ) qs.set("q", searchQ);
       return qs.toString();
     },
-    [view, page, activeTag, activeTags, sortCol, sortDir, containsCol, containsVal]
+    [view, page, apiPageSize, activeTag, activeTags, sortCol, sortDir, valueFilters, searchQ]
   );
 
   const applyPayload = useCallback((d) => {
@@ -228,6 +322,47 @@ export default function ReviewStep({ file, onCommitted }) {
     loadProfile();
   }, [loadProfile]);
 
+  // Debounce the tab-wide search box: only hit the server ~300ms after typing
+  // stops, and jump back to page 1 for the new result set.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setSearchQ(search.trim());
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // Debounce the unique-panel search the same way — it drives a server fetch so a
+  // value beyond the display cap is still found (accurate, not just the top N).
+  useEffect(() => {
+    const t = setTimeout(() => setUniqueSearchQ(uniqueSearch.trim()), 250);
+    return () => clearTimeout(t);
+  }, [uniqueSearch]);
+
+  // Fetch the open column's unique values, server-side searched. Re-runs when the
+  // column, the debounced search, or the post-merge nonce changes. A cancel flag
+  // drops a stale response so fast typing can't leave the wrong list showing.
+  useEffect(() => {
+    if (!uniqueCol) return;
+    let cancelled = false;
+    setUniqueLoading(true);
+    (async () => {
+      try {
+        const qs = new URLSearchParams({ column: uniqueCol });
+        if (uniqueSearchQ) qs.set("q", uniqueSearchQ);
+        const d = await api(`/api/files/${file.id}/columns/unique?${qs.toString()}`);
+        if (!cancelled) setUniqueValues(d.values || []);
+      } catch (e) {
+        if (!cancelled) setError(e.message);
+      } finally {
+        if (!cancelled) setUniqueLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [uniqueCol, uniqueSearchQ, uniqueNonce, file.id]);
+
   // Keep the top scrollbar's width in sync with the grid's full content width so
   // the user can scroll horizontally from the top without reaching the bottom.
   // Only show it when the grid actually overflows (otherwise it's a stray empty
@@ -238,6 +373,15 @@ export default function ReviewStep({ file, onCommitted }) {
     const measure = () => {
       setGridWidth(el.scrollWidth);
       setHasXOverflow(el.scrollWidth > el.clientWidth + 1);
+      setFrozenLefts((prev) => {
+        const next = measureFrozen(el);
+        // Sticky positioning doesn't change layout, so this can't feed back into
+        // the ResizeObserver — but bail on an identical result anyway to avoid a
+        // pointless re-render of a very large grid.
+        return prev.length === next.length && prev.every((v, i) => v === next[i])
+          ? prev
+          : next;
+      });
     };
     measure();
     window.addEventListener("resize", measure);
@@ -284,6 +428,22 @@ export default function ReviewStep({ file, onCommitted }) {
     setPage(0);
     clearSelection();
   }
+
+  // Row count per page. Page 1 is the only page guaranteed to exist afterwards,
+  // and a cross-page selection no longer means what it did, so reset both.
+  function changePageSize(n) {
+    setPageSize(n);
+    setPage(0);
+    clearSelection();
+  }
+
+  // Excel-style frozen panes. `i` is the column's position in displayColumns;
+  // the pinned ones get a measured `left` so they stack flush against each other.
+  const isFrozen = (i) => i < frozenLefts.length;
+  const frozenClass = (i) =>
+    isFrozen(i)
+      ? ` col-frozen${i === frozenLefts.length - 1 ? " col-frozen-last" : ""}`
+      : "";
 
   function clearSelection() {
     setSelected(new Set());
@@ -444,6 +604,34 @@ export default function ReviewStep({ file, onCommitted }) {
     setPage(0);
   }
 
+  // --- Fill a column with a constant value (empty cells only) ----------------
+  function openFill(col = "") {
+    setHeaderMenuCol(null);
+    const chosen = col || allMasterColumns[0] || "";
+    setFillCol(chosen);
+    setFillVal((file.constants && file.constants[chosen]) || "");
+    setShowFill(true);
+  }
+
+  // Setting an empty value clears the constant for that column.
+  async function applyFill() {
+    if (!fillCol) return;
+    setFillBusy(true);
+    setError("");
+    try {
+      const d = await api(
+        `/api/files/${file.id}/columns/fill?column=${encodeURIComponent(fillCol)}&${buildQs(true)}`,
+        { method: "POST", body: { value: fillVal } }
+      );
+      applyPayload(d);
+      setShowFill(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setFillBusy(false);
+    }
+  }
+
   // --- Column header menu / editing / unique values --------------------------
   // The grid scrolls with overflow:hidden cells, so an in-flow dropdown would be
   // clipped. Instead we anchor a fixed-position menu to the clicked header.
@@ -475,47 +663,58 @@ export default function ReviewStep({ file, onCommitted }) {
     setEditConfirmed(false);
   }
 
-  async function openUnique(col) {
+  // Open the panel and clear its search. The values are loaded by the fetch effect
+  // (keyed on uniqueCol/search/nonce), so the list stays in sync with the search.
+  function openUnique(col) {
     setHeaderMenuCol(null);
-    setUniqueCol(col);
-    setUniqueSearch("");
     setUniqueValues([]);
+    setUniqueSearch("");
+    setUniqueSearchQ("");
     resetMerge();
-    setUniqueLoading(true);
-    try {
-      const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/unique`
-      );
-      setUniqueValues(d.values || []);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setUniqueLoading(false);
-    }
+    setUniqueCol(col);
   }
 
-  // Refresh the unique-values list (after a merge the variant is gone and the
-  // canonical value's count has grown).
-  async function reloadUnique(col) {
-    try {
-      const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/unique`
-      );
-      setUniqueValues(d.values || []);
-    } catch (e) {
-      setError(e.message);
-    }
-  }
-
+  // Toggle one value of the current column in/out of the filter set. Columns are
+  // AND'd; values within a column OR — and picking a value on a second column
+  // adds to the filter instead of replacing the first, so filters stack.
   function pickUnique(value) {
-    setContainsCol(uniqueCol);
-    setContainsVal(value);
+    setValueFilters((f) => {
+      const cur = f[uniqueCol] || [];
+      const next = cur.includes(value)
+        ? cur.filter((v) => v !== value)
+        : [...cur, value];
+      const out = { ...f };
+      if (next.length) out[uniqueCol] = next;
+      else delete out[uniqueCol]; // last value removed -> drop the column filter
+      return out;
+    });
+    setPage(0);
+  }
+
+  // Drop one value from a column's filter (used by the active-filter chips).
+  function removeValueFilter(col, value) {
+    setValueFilters((f) => {
+      const next = (f[col] || []).filter((v) => v !== value);
+      const out = { ...f };
+      if (next.length) out[col] = next;
+      else delete out[col];
+      return out;
+    });
+    setPage(0);
+  }
+
+  // Clear every value on one column (the unique panel's "Clear" foot).
+  function clearColumnFilter(col) {
+    setValueFilters((f) => {
+      const out = { ...f };
+      delete out[col];
+      return out;
+    });
     setPage(0);
   }
 
   function clearContains() {
-    setContainsCol("");
-    setContainsVal("");
+    setValueFilters({});
     setPage(0);
   }
 
@@ -536,6 +735,9 @@ export default function ReviewStep({ file, onCommitted }) {
     setMergePicked(new Set());
     setMergeTarget("");
     setMergeConfirm(null);
+    setSimilarBase(null);
+    setSimilarMatches([]);
+    setSimilarLoading(false);
   }
 
   function toggleMergePick(value) {
@@ -548,6 +750,46 @@ export default function ReviewStep({ file, onCommitted }) {
     setMergeTarget((t) => t || value);
   }
 
+  // Similarity-assisted merge: pick a value, and the panel surfaces just its close
+  // variants (pre-checked) so the reviewer merges an accurate cluster in one go —
+  // then the same preview + confirm as a manual merge.
+  async function loadSimilar(base, ratio) {
+    setSimilarLoading(true);
+    setError("");
+    try {
+      const qs = new URLSearchParams({
+        column: uniqueCol,
+        value: base,
+        min_ratio: String(ratio),
+      });
+      const d = await api(`/api/files/${file.id}/columns/similar?${qs.toString()}`);
+      const matches = d.matches || [];
+      setSimilarMatches(matches);
+      // Pre-check every suggestion — they all clear the threshold; the reviewer
+      // unticks any false positive before confirming.
+      setMergePicked(new Set(matches.map((m) => m.value)));
+    } catch (e) {
+      setError(e.message);
+      setSimilarMatches([]);
+    } finally {
+      setSimilarLoading(false);
+    }
+  }
+
+  function findSimilar(value) {
+    setMergeMode(true);
+    setMergeConfirm(null);
+    setSimilarBase(value);
+    setMergeTarget(value); // the clicked value is the canonical keeper by default
+    loadSimilar(value, similarRatio);
+  }
+
+  // Re-run the similarity search when the reviewer loosens/tightens the strictness.
+  function changeSimilarRatio(ratio) {
+    setSimilarRatio(ratio);
+    if (similarBase) loadSimilar(similarBase, ratio);
+  }
+
   // Step 1: ask the server how many rows the merge would touch, then confirm.
   async function requestMerge() {
     const from = [...mergePicked];
@@ -557,7 +799,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setError("");
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(uniqueCol)}/remap/preview`,
+        `/api/files/${file.id}/columns/remap/preview?column=${encodeURIComponent(uniqueCol)}`,
         { method: "POST", body: { from_values: from, to } }
       );
       setMergeConfirm({ from, to, count: d.affected_rows });
@@ -577,7 +819,7 @@ export default function ReviewStep({ file, onCommitted }) {
     setError("");
     try {
       const d = await api(
-        `/api/files/${file.id}/columns/${encodeURIComponent(col)}/remap?${buildQs(true)}`,
+        `/api/files/${file.id}/columns/remap?column=${encodeURIComponent(col)}&${buildQs(true)}`,
         {
           method: "POST",
           body: { from_values: mergeConfirm.from, to: mergeConfirm.to },
@@ -585,7 +827,7 @@ export default function ReviewStep({ file, onCommitted }) {
       );
       applyPayload(d);
       resetMerge();
-      await reloadUnique(col);
+      setUniqueNonce((n) => n + 1); // re-fetch the unique list (variant is gone now)
     } catch (err) {
       setError(err.message);
     } finally {
@@ -618,6 +860,75 @@ export default function ReviewStep({ file, onCommitted }) {
     if (selectAllPages) await acceptRows([], true);
     else if (selected.size > 0) await acceptRows([...selected]);
     clearSelection();
+  }
+
+  // --- Undo a manual clean: back to "Needs review" ---------------------------
+  // Destructive (any inline edits on those rows are thrown away), so every entry
+  // point routes through a confirmation first.
+  function askRevert(rowIndexes, all = false) {
+    const count = all ? total : rowIndexes.length;
+    if (count > 0) setRevertConfirm({ rows: all ? [] : rowIndexes, all, count });
+  }
+
+  // Drops the rows' "kept as-is" acceptance and their corrections, so they
+  // re-clean from the original values and their flags come back.
+  async function confirmRevert() {
+    const req = revertConfirm;
+    if (!req) return;
+    setRevertConfirm(null);
+    // One row reverted from its own button gets the same inline spinner as a keep.
+    const single = !req.all && req.rows.length === 1 ? req.rows[0] : null;
+    if (single !== null) markPending(single, true);
+    setBusy(true);
+    setError("");
+    try {
+      const qs = buildQs(true) + (req.all ? "&select_all=true" : "");
+      const d = await api(`/api/files/${file.id}/revert?${qs}`, {
+        method: "POST",
+        body: { rows: req.rows },
+      });
+      applyPayload(d);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      if (single !== null) markPending(single, false);
+      setBusy(false);
+    }
+  }
+
+  // --- Delete rows from the file --------------------------------------------
+  // Removes rows outright (excluded from every tab, from exports, and from the
+  // master save). Destructive, so every entry point routes through a confirm.
+  // `all` deletes every row in the current filtered view (across all pages).
+  function askDrop(rowIndexes, all = false) {
+    const count = all ? total : rowIndexes.length;
+    if (count > 0) setDropConfirm({ rows: all ? [] : rowIndexes, all, count });
+  }
+
+  async function confirmDrop() {
+    const req = dropConfirm;
+    if (!req) return;
+    setDropConfirm(null);
+    // A single row deleted from its own button gets an inline spinner.
+    const single = !req.all && req.rows.length === 1 ? req.rows[0] : null;
+    if (single !== null) markPending(single, true);
+    setBusy(true);
+    setError("");
+    try {
+      const qs = buildQs(true) + (req.all ? "&select_all=true" : "");
+      const d = await api(`/api/files/${file.id}/drop?${qs}`, {
+        method: "POST",
+        body: { rows: req.rows },
+      });
+      applyPayload(d);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      if (single !== null) markPending(single, false);
+      setBusy(false);
+    }
   }
 
   async function runBulk(action) {
@@ -736,14 +1047,14 @@ export default function ReviewStep({ file, onCommitted }) {
   function buildDownloadName() {
     const slug = (s) =>
       String(s).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-    const parts = [];
-    if (view === "error") parts.push("needs_review");
-    else if (view === "clean") parts.push("clean");
-    else parts.push("all_rows");
+    const parts = [VIEW_SLUG[view] || "all_rows"];
     if (activeTag) parts.push(tagLabel[activeTag] || activeTag);
     activeTags.forEach((t) => parts.push(tagLabel[t] || t));
     if (sortCol) parts.push(`${sortCol}_${sortDir}`);
-    if (containsCol && containsVal) parts.push(`${containsCol}_${containsVal}`);
+    Object.entries(valueFilters).forEach(([col, vals]) =>
+      parts.push(`${col}_${vals.join("_")}`)
+    );
+    if (searchQ) parts.push(`search_${searchQ}`);
     const descriptor = parts.map(slug).filter(Boolean).join("_");
     const base =
       slug((file.original_name || "file").replace(/\.[^.]+$/, "")) || "file";
@@ -765,10 +1076,10 @@ export default function ReviewStep({ file, onCommitted }) {
         qs.set("sort", sortCol);
         qs.set("dir", sortDir);
       }
-      if (containsCol && containsVal) {
-        qs.set("contains_col", containsCol);
-        qs.set("contains_val", containsVal);
+      if (Object.keys(valueFilters).length) {
+        qs.set("filters", JSON.stringify(valueFilters));
       }
+      if (searchQ) qs.set("q", searchQ);
       await download(`/api/files/${file.id}/export?${qs.toString()}`, name);
     } catch (err) {
       setError(err.message);
@@ -947,8 +1258,19 @@ export default function ReviewStep({ file, onCommitted }) {
             <button className={view === "error" ? "active" : ""} onClick={() => switchView("error")}>
               Needs review ({errorsLeft})
             </button>
-            <button className={view === "clean" ? "active" : ""} onClick={() => switchView("clean")}>
-              Clean ({summary?.clean ?? 0})
+            <button
+              className={view === "auto_clean" ? "active" : ""}
+              onClick={() => switchView("auto_clean")}
+              title="Rows the tool cleaned on its own — no human touched them"
+            >
+              Auto Cleaned ({summary?.auto_clean ?? 0})
+            </button>
+            <button
+              className={view === "manual_clean" ? "active" : ""}
+              onClick={() => switchView("manual_clean")}
+              title="Rows you reviewed — edited or kept as-is — and sent to the clean set"
+            >
+              Manual Cleaned ({summary?.manual_clean ?? 0})
             </button>
           </div>
           <button className="btn sm filter-btn" onClick={openFilters}>
@@ -958,6 +1280,33 @@ export default function ReviewStep({ file, onCommitted }) {
               <span className="filter-n">{activeTags.length + (sortCol ? 1 : 0)}</span>
             )}
           </button>
+          <button
+            className="btn sm"
+            onClick={() => openFill()}
+            title="Fill every empty cell of a column with one value (filled cells are left untouched)"
+          >
+            <Icon name="plus" size={14} />
+            Add column value
+          </button>
+        </div>
+        {/* Tab-wide search — available in every view tab. Matches any column
+            (substring), so pasting a value from the grid jumps straight to it. */}
+        <div className="grid-search" title="Search across all columns in this tab">
+          <Icon name="search" size={14} />
+          <input
+            placeholder="Search this tab…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {search && (
+            <button
+              className="grid-search-clear"
+              onClick={() => setSearch("")}
+              title="Clear search"
+            >
+              <Icon name="x" size={12} />
+            </button>
+          )}
         </div>
         <button
           className="btn sm primary"
@@ -1033,9 +1382,18 @@ export default function ReviewStep({ file, onCommitted }) {
       )}
 
       {/* Active-filter chips — what's currently applied via the Filters popup */}
-      {(activeTags.length > 0 || sortCol || containsCol) && (
+      {(activeTags.length > 0 || sortCol || Object.keys(valueFilters).length > 0 || searchQ) && (
         <div className="review-toolbar">
           <div className="active-filters">
+            {searchQ && (
+              <span className="filter-chip alt">
+                <Icon name="search" size={12} />
+                “{searchQ}”
+                <button onClick={() => setSearch("")} title="Clear search">
+                  <Icon name="x" size={11} />
+                </button>
+              </span>
+            )}
             {activeTags.map((t) => (
               <span className="filter-chip" key={t}>
                 {tagLabel[t] || t}
@@ -1059,15 +1417,25 @@ export default function ReviewStep({ file, onCommitted }) {
                 </button>
               </span>
             )}
-            {containsCol && (
-              <span className="filter-chip alt">
-                {containsCol}: “{containsVal}”
-                <button onClick={clearContains} title="Clear value filter">
-                  <Icon name="x" size={11} />
-                </button>
-              </span>
+            {/* One chip per picked value, so several stacked filters are all visible
+                and each removable on its own. */}
+            {Object.entries(valueFilters).flatMap(([col, vals]) =>
+              vals.map((v) => (
+                <span className="filter-chip alt" key={`${col}::${v}`}>
+                  {col}: “{v}”
+                  <button
+                    onClick={() => removeValueFilter(col, v)}
+                    title="Clear this value filter"
+                  >
+                    <Icon name="x" size={11} />
+                  </button>
+                </span>
+              ))
             )}
-            <button className="link-btn" onClick={() => { clearFilters(); clearContains(); }}>
+            <button
+              className="link-btn"
+              onClick={() => { clearFilters(); clearContains(); setSearch(""); }}
+            >
               Clear all
             </button>
           </div>
@@ -1078,10 +1446,29 @@ export default function ReviewStep({ file, onCommitted }) {
       <div className="grid-legend">
         <span><i className="lg-dot green" /> Auto-fixed (labelled by what changed)</span>
         <span><i className="lg-dot" style={{ background: tagColor("corrected") }} /> Manually corrected</span>
+        {(summary?.fix_tags || []).some((t) => t.tag === "merged") && (
+          <span><i className="lg-dot" style={{ background: tagColor("merged") }} /> Merged value</span>
+        )}
         <span><i className="lg-dot red" /> Needs your review</span>
         <span><i className="lg-dot blank" /> Empty cell</span>
-        <span className="muted small lg-hint">Hover a cell to see the original value · click a flagged cell to edit</span>
+        <span className="muted small lg-hint">
+          {view === "manual_clean"
+            ? "Ringed cells are the ones you changed · “kept” rows were accepted as-is · tick rows (or use ←) to send them back to review"
+            : "Hover a cell to see the original value · click a flagged cell to edit"}
+        </span>
       </div>
+
+      {/* Pager above the grid too, so changing page never means scrolling to the
+          bottom of a 50-row table first. */}
+      <Pager
+        page={page}
+        pages={pages}
+        total={total}
+        disabled={loading}
+        onChange={setPage}
+        pageSize={pageSize}
+        onPageSizeChange={changePageSize}
+      />
 
       {/* Top horizontal scrollbar, synced with the grid — scroll across columns
           without having to reach the bottom of the table first. Shown only when
@@ -1112,13 +1499,16 @@ export default function ReviewStep({ file, onCommitted }) {
                   title="Select all rows on this page"
                 />
               </th>
-              {displayColumns.map((c) => (
+              {displayColumns.map((c, ci) => (
                 <th
                   key={c}
                   className={`${focusSet.has(c) ? "col-focus" : ""}${
                     editCol === c ? " col-editing" : ""
-                  }`}
-                  style={focusSet.has(c) ? { "--tag": tagColor(activeTag) } : undefined}
+                  }${frozenClass(ci)}`}
+                  style={{
+                    ...(focusSet.has(c) ? { "--tag": tagColor(activeTag) } : null),
+                    ...(isFrozen(ci) ? { left: frozenLefts[ci] } : null),
+                  }}
                 >
                   <div className="th-inner">
                     <button
@@ -1152,8 +1542,12 @@ export default function ReviewStep({ file, onCommitted }) {
                     <td className="rownum">
                       <span className="sk sk-line" style={{ width: 20, height: 10 }} />
                     </td>
-                    {displayColumns.map((c) => (
-                      <td key={c}>
+                    {displayColumns.map((c, ci) => (
+                      <td
+                        key={c}
+                        className={frozenClass(ci).trim()}
+                        style={isFrozen(ci) ? { left: frozenLefts[ci] } : undefined}
+                      >
                         <span className="sk sk-line" style={{ width: "80%", height: 10 }} />
                       </td>
                     ))}
@@ -1168,6 +1562,8 @@ export default function ReviewStep({ file, onCommitted }) {
                       key={row.row_index}
                       className={`${row.status === "error" ? "row-err" : ""}${
                         selectAllPages || selected.has(row.row_index) ? " row-sel" : ""
+                      }${
+                        view === "manual_clean" && row.manual_kind ? " row-manual" : ""
                       }`}
                     >
                       <td className="rownum">
@@ -1196,16 +1592,49 @@ export default function ReviewStep({ file, onCommitted }) {
                           >
                             <Icon name="check" size={12} />
                           </button>
+                        ) : view === "manual_clean" && row.manual_kind ? (
+                          <>
+                            {row.manual_kind === "kept" && (
+                              // Nothing on this row changed — the reviewer accepted it
+                              // as-is, so there's no cell to highlight. Mark the row.
+                              <span className="row-kept" title="Kept as-is by a reviewer — values unchanged">
+                                kept
+                              </span>
+                            )}
+                            <button
+                              className="cell-revert"
+                              title="Send this row back to Needs review (undoes the manual clean)"
+                              onClick={() => askRevert([row.row_index])}
+                            >
+                              <Icon name="arrowLeft" size={12} />
+                            </button>
+                          </>
                         ) : null}
+                        {/* Delete this row — available on any resting row in any tab. */}
+                        {!pendingRows.has(row.row_index) && !hasDraft && (
+                          <button
+                            className="cell-drop"
+                            title="Remove this row from the file (excluded from export and the master save)"
+                            onClick={() => askDrop([row.row_index])}
+                          >
+                            <Icon name="trash" size={12} />
+                          </button>
+                        )}
                       </td>
-                      {displayColumns.map((c) => {
+                      {displayColumns.map((c, ci) => {
                         const issue = errs[c];
                         const val = drafts[row.row_index]?.[c] ?? row.values[c] ?? "";
+                        // A pinned cell needs the same measured offset as its header.
+                        const pin = isFrozen(ci) ? { left: frozenLefts[ci] } : null;
                         // Whole-column edit mode: every cell of this column on the
                         // page becomes a plain editable input (page-only scope).
                         if (editCol === c) {
                           return (
-                            <td key={c} className="cell-edit">
+                            <td
+                              key={c}
+                              className={`cell-edit${frozenClass(ci)}`}
+                              style={pin || undefined}
+                            >
                               <input
                                 value={val}
                                 onChange={(e) =>
@@ -1219,8 +1648,8 @@ export default function ReviewStep({ file, onCommitted }) {
                           return (
                             <td
                               key={c}
-                              className="cell-flagged"
-                              style={{ "--tag": tagColor(issue.tag) }}
+                              className={`cell-flagged${frozenClass(ci)}`}
+                              style={{ "--tag": tagColor(issue.tag), ...pin }}
                               title={issue.message}
                             >
                               <input
@@ -1242,14 +1671,19 @@ export default function ReviewStep({ file, onCommitted }) {
                         const fix = fixes[c];
                         if (fix) {
                           const from = (fix.original || "").trim();
+                          // A cell a human changed (typed edit or value-merge) gets a
+                          // stronger wash + border than the tool's own green auto-fixes,
+                          // so it's obvious on a later review.
+                          const manual = fix.tag === "corrected" || fix.tag === "merged";
                           return (
                             <td
                               key={c}
-                              className="cell-fixed"
-                              style={{ "--tag": tagColor(fix.tag) }}
-                              title={`${tagLabel[fix.tag] || "Auto-fixed"}${
-                                from ? ` — was “${from}”` : ""
-                              }`}
+                              className={`cell-fixed${manual ? " cell-manual" : ""}${frozenClass(ci)}`}
+                              style={{ "--tag": tagColor(fix.tag), ...pin }}
+                              title={`${
+                                tagLabel[fix.tag] ||
+                                (manual ? "Manually corrected" : "Auto-fixed")
+                              }${from ? ` — was “${from}”` : ""}`}
                             >
                               <span className="fixed-val">
                                 <span className="fix-mark">
@@ -1272,7 +1706,8 @@ export default function ReviewStep({ file, onCommitted }) {
                         return (
                           <td
                             key={c}
-                            className={val === "" ? "cell-blank" : ""}
+                            className={`${val === "" ? "cell-blank" : ""}${frozenClass(ci)}`}
+                            style={pin || undefined}
                             title={val || undefined}
                           >
                             {val || "—"}
@@ -1286,7 +1721,7 @@ export default function ReviewStep({ file, onCommitted }) {
               <tr>
                 <td colSpan={displayColumns.length + 1} className="grid-empty">
                   <Icon name="check" size={20} />
-                  {view === "error" ? "Nothing left to review here 🎉" : "No rows to show."}
+                  {EMPTY_TEXT[view] || "No rows to show."}
                 </td>
               </tr>
             )}
@@ -1315,9 +1750,34 @@ export default function ReviewStep({ file, onCommitted }) {
             <button className="btn sm" onClick={clearSelection} disabled={busy}>
               Clear
             </button>
-            <button className="btn primary sm" onClick={keepSelected} disabled={busy}>
-              <Icon name="check" size={15} />
-              {busy ? "Keeping…" : "Keep selected as-is"}
+            {view === "manual_clean" ? (
+              // These rows are already clean — offer to undo the manual clean and
+              // send them back to the review queue.
+              <button
+                className="btn sm"
+                onClick={() => askRevert([...selected], selectAllPages)}
+                disabled={busy}
+                title="Undo the manual clean and put these rows back in Needs review"
+              >
+                <Icon name="arrowLeft" size={15} />
+                {busy ? "Reverting…" : "Send back to review"}
+              </button>
+            ) : (
+              <button className="btn primary sm" onClick={keepSelected} disabled={busy}>
+                <Icon name="check" size={15} />
+                {busy ? "Keeping…" : "Keep selected as-is"}
+              </button>
+            )}
+            {/* Delete works in every tab — remove the selected rows from the file
+                entirely (they won't export or reach the master save). */}
+            <button
+              className="btn danger sm"
+              onClick={() => askDrop([...selected], selectAllPages)}
+              disabled={busy}
+              title="Remove the selected rows from the file (excluded from export and the master save)"
+            >
+              <Icon name="trash" size={15} />
+              {busy ? "Removing…" : `Remove selected`}
             </button>
           </div>
         </div>
@@ -1384,23 +1844,15 @@ export default function ReviewStep({ file, onCommitted }) {
       )}
 
       {/* Pagination */}
-      {pages > 1 && (
-        <div className="pager">
-          <button className="btn sm" disabled={page === 0 || loading} onClick={() => setPage((p) => p - 1)}>
-            ← Prev
-          </button>
-          <span className="muted small">
-            Page {page + 1} of {pages} · {total} row{total === 1 ? "" : "s"}
-          </span>
-          <button
-            className="btn sm"
-            disabled={page >= pages - 1 || loading}
-            onClick={() => setPage((p) => p + 1)}
-          >
-            Next →
-          </button>
-        </div>
-      )}
+      <Pager
+        page={page}
+        pages={pages}
+        total={total}
+        disabled={loading}
+        onChange={setPage}
+        pageSize={pageSize}
+        onPageSizeChange={changePageSize}
+      />
 
       {/* Column-header menu — fixed-positioned so the scroll container can't clip it */}
       {headerMenuCol && headerMenuPos && (
@@ -1410,6 +1862,9 @@ export default function ReviewStep({ file, onCommitted }) {
         >
           <button onClick={() => startEditCol(headerMenuCol)}>
             <Icon name="edit" size={13} /> Edit column
+          </button>
+          <button onClick={() => openFill(headerMenuCol)}>
+            <Icon name="plus" size={13} /> Fill empty cells…
           </button>
           <button onClick={() => openUnique(headerMenuCol)}>
             <Icon name="table" size={13} /> Show unique values
@@ -1485,6 +1940,71 @@ export default function ReviewStep({ file, onCommitted }) {
         </div>
       )}
 
+      {/* Fill-a-column popup — broadcast a constant into empty cells only */}
+      {showFill && (
+        <div className="save-overlay" onClick={() => setShowFill(false)}>
+          <div className="filter-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="filter-modal-head">
+              <h3>
+                <Icon name="plus" size={16} /> Add a column value
+              </h3>
+              <button className="icon-btn" onClick={() => setShowFill(false)}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">Column</label>
+              <select
+                value={fillCol}
+                onChange={(e) => {
+                  const c = e.target.value;
+                  setFillCol(c);
+                  setFillVal((file.constants && file.constants[c]) || "");
+                }}
+              >
+                {allMasterColumns.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="filter-section">
+              <label className="filter-section-label">
+                Value to fill into empty cells
+              </label>
+              <input
+                placeholder="e.g. Artium | Goongoonalo  or  50 | 50"
+                value={fillVal}
+                onChange={(e) => setFillVal(e.target.value)}
+                autoFocus
+              />
+              <p className="muted small" style={{ marginTop: "0.5rem" }}>
+                This fills <strong>every empty cell</strong> of{" "}
+                <strong>{fillCol || "the column"}</strong> with this value. Cells
+                that already have a value are <strong>left untouched</strong>.
+                Clear the box and apply to remove the fill.
+              </p>
+            </div>
+
+            <div className="filter-modal-actions">
+              <button className="btn sm" onClick={() => setShowFill(false)} disabled={fillBusy}>
+                Cancel
+              </button>
+              <button
+                className="btn primary sm"
+                onClick={applyFill}
+                disabled={fillBusy || !fillCol}
+              >
+                {fillBusy ? "Filling…" : fillVal.trim() ? "Fill empty cells" : "Clear fill"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Save confirmation popup */}
       {showSaveConfirm && (
         <div className="save-overlay" onClick={() => setShowSaveConfirm(false)}>
@@ -1512,6 +2032,67 @@ export default function ReviewStep({ file, onCommitted }) {
               >
                 <Icon name="check" size={15} />
                 Save {summary?.clean ?? 0} row{summary?.clean === 1 ? "" : "s"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* "Send back to review" confirmation — it discards manual edits, so ask */}
+      {revertConfirm && (
+        <div className="save-overlay" onClick={() => setRevertConfirm(null)}>
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark danger">
+              <Icon name="arrowLeft" size={22} />
+            </div>
+            <h3>
+              Send {revertConfirm.count} row{revertConfirm.count === 1 ? "" : "s"} back to
+              review?
+            </h3>
+            <p className="muted">
+              <strong>Manual edits on these rows are discarded</strong> — the tool’s own
+              cleaned values come back, along with any flags, so they’ll need reviewing
+              again. A row that had no flags to begin with just moves to Auto Cleaned.
+            </p>
+            <div className="confirm-actions">
+              <button className="btn sm" onClick={() => setRevertConfirm(null)} disabled={busy}>
+                Cancel
+              </button>
+              <button className="btn danger sm" onClick={confirmRevert} disabled={busy}>
+                <Icon name="arrowLeft" size={15} />
+                {busy ? "Reverting…" : "Send back to review"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirmation — removing rows is destructive, so confirm first */}
+      {dropConfirm && (
+        <div className="save-overlay" onClick={() => setDropConfirm(null)}>
+          <div className="confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-spark danger">
+              <Icon name="trash" size={22} />
+            </div>
+            <h3>
+              Remove {dropConfirm.count} row{dropConfirm.count === 1 ? "" : "s"} from the
+              file?
+            </h3>
+            <p className="muted">
+              {dropConfirm.all
+                ? "Every row in the current filtered view (across all pages) is removed."
+                : "The selected row(s) are removed."}{" "}
+              <strong>They’re excluded from every tab, from Excel exports, and from
+              the master save.</strong>{" "}
+              You can bring them back by re-uploading the file.
+            </p>
+            <div className="confirm-actions">
+              <button className="btn sm" onClick={() => setDropConfirm(null)} disabled={busy}>
+                Cancel
+              </button>
+              <button className="btn danger sm" onClick={confirmDrop} disabled={busy}>
+                <Icon name="trash" size={15} />
+                {busy ? "Removing…" : `Remove ${dropConfirm.count} row${dropConfirm.count === 1 ? "" : "s"}`}
               </button>
             </div>
           </div>
@@ -1570,7 +2151,9 @@ export default function ReviewStep({ file, onCommitted }) {
 
             {/* Merge variants into one canonical value — tick the duplicates,
                 type the correct spelling, confirm. Applies to every matching cell
-                (pipe-aware) but only when the reviewer confirms. */}
+                (pipe-aware) but only when the reviewer confirms. Two ways in:
+                manual (tick from the whole list) or "find similar" (auto-cluster a
+                value's close spelling variants). */}
             <div className="unique-mergebar">
               <button
                 className={`btn sm ${mergeMode ? "primary" : ""}`}
@@ -1580,14 +2163,65 @@ export default function ReviewStep({ file, onCommitted }) {
                 <Icon name="check" size={14} />
                 {mergeMode ? "Cancel merge" : "Merge values"}
               </button>
-              {mergeMode && (
+              {mergeMode && !similarBase && (
                 <span className="muted small">
-                  Tick the variants to merge, then choose the correct value.
+                  Tick the variants to merge, then choose the correct value — or click
+                  the ✦ on any value to auto-find its close matches.
                 </span>
+              )}
+              {similarBase && (
+                <div className="similar-controls">
+                  <span className="muted small">
+                    Close matches of <strong>“{similarBase}”</strong>
+                  </span>
+                  <label className="similar-strict">
+                    Match
+                    <select
+                      value={similarRatio}
+                      onChange={(e) => changeSimilarRatio(Number(e.target.value))}
+                    >
+                      <option value={0.9}>≥ 90% (strict)</option>
+                      <option value={0.8}>≥ 80%</option>
+                      <option value={0.7}>≥ 70% (loose)</option>
+                    </select>
+                  </label>
+                </div>
               )}
             </div>
             <div className="unique-list">
-              {uniqueLoading ? (
+              {similarBase ? (
+                // "Find similar" mode: show only the close matches (checkboxes),
+                // most-similar first, each with its similarity %.
+                similarLoading ? (
+                  <p className="muted small" style={{ padding: "0.75rem" }}>
+                    Finding similar values…
+                  </p>
+                ) : similarMatches.length === 0 ? (
+                  <p className="muted small" style={{ padding: "0.75rem" }}>
+                    No values within this similarity. Try a looser match above.
+                  </p>
+                ) : (
+                  similarMatches.map((u) => (
+                    <label
+                      className={`unique-row${mergePicked.has(u.value) ? " picked" : ""}`}
+                      key={u.value}
+                      title="Merge this variant into the canonical value"
+                    >
+                      <input
+                        type="checkbox"
+                        className="row-check"
+                        checked={mergePicked.has(u.value)}
+                        onChange={() => toggleMergePick(u.value)}
+                      />
+                      <span className="unique-val">{u.value}</span>
+                      <span className="unique-ratio" title="How closely this matches">
+                        {Math.round(u.ratio * 100)}%
+                      </span>
+                      <span className="unique-count">{u.count}</span>
+                    </label>
+                  ))
+                )
+              ) : uniqueLoading ? (
                 <p className="muted small" style={{ padding: "0.75rem" }}>
                   Loading…
                 </p>
@@ -1635,21 +2269,38 @@ export default function ReviewStep({ file, onCommitted }) {
                       </label>
                     ));
                   }
-                  return shown.map((u) => (
-                    <button
-                      className={`unique-row${
-                        containsCol === uniqueCol && containsVal === u.value
-                          ? " active"
-                          : ""
-                      }`}
-                      key={u.value}
-                      onClick={() => pickUnique(u.value)}
-                      title="Filter the grid to rows containing this value"
-                    >
-                      <span className="unique-val">{u.value}</span>
-                      <span className="unique-count">{u.count}</span>
-                    </button>
-                  ));
+                  return shown.map((u) => {
+                    const checked = (valueFilters[uniqueCol] || []).includes(
+                      u.value
+                    );
+                    return (
+                      <div
+                        className={`unique-row${checked ? " active" : ""}`}
+                        key={u.value}
+                      >
+                        <label
+                          className="unique-pick"
+                          title="Tick to filter the grid by this value — pick several to see them all at once"
+                        >
+                          <input
+                            type="checkbox"
+                            className="row-check"
+                            checked={checked}
+                            onChange={() => pickUnique(u.value)}
+                          />
+                          <span className="unique-val">{u.value}</span>
+                        </label>
+                        <button
+                          className="unique-similar-btn"
+                          onClick={() => findSimilar(u.value)}
+                          title={`Find & merge values similar to “${u.value}”`}
+                        >
+                          <Icon name="sparkles" size={13} />
+                        </button>
+                        <span className="unique-count">{u.count}</span>
+                      </div>
+                    );
+                  });
                 })()
               )}
             </div>
@@ -1678,12 +2329,16 @@ export default function ReviewStep({ file, onCommitted }) {
                 </button>
               </div>
             )}
-            {!mergeMode && containsCol === uniqueCol && containsVal && (
+            {!mergeMode && (valueFilters[uniqueCol] || []).length > 0 && (
               <div className="unique-foot">
                 <span className="muted small">
-                  Filtering by “{containsVal}”
+                  Filtering by {valueFilters[uniqueCol].length} value
+                  {valueFilters[uniqueCol].length === 1 ? "" : "s"} in {uniqueCol}
                 </span>
-                <button className="link-btn" onClick={clearContains}>
+                <button
+                  className="link-btn"
+                  onClick={() => clearColumnFilter(uniqueCol)}
+                >
                   Clear
                 </button>
               </div>
