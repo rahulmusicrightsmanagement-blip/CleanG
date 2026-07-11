@@ -58,6 +58,7 @@ const VIEW_SLUG = {
   error: "needs_review",
   auto_clean: "auto_cleaned",
   manual_clean: "manual_cleaned",
+  deleted: "deleted_records",
 };
 
 /**
@@ -90,6 +91,7 @@ const EMPTY_TEXT = {
   error: "Nothing left to review here 🎉",
   auto_clean: "No rows were cleaned automatically.",
   manual_clean: "No rows cleaned manually yet — fix or keep a flagged row and it lands here.",
+  deleted: "No deleted records yet — remove a row and it lands here.",
 };
 
 export default function ReviewStep({ file, onCommitted }) {
@@ -97,7 +99,7 @@ export default function ReviewStep({ file, onCommitted }) {
   const [profile, setProfile] = useState(null);
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
-  const [view, setView] = useState("all"); // all | error | auto_clean | manual_clean
+  const [view, setView] = useState("all"); // all | error | auto_clean | manual_clean | deleted
   const [activeTag, setActiveTag] = useState(null);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(50); // 0 = All
@@ -931,6 +933,31 @@ export default function ReviewStep({ file, onCommitted }) {
     }
   }
 
+  // --- Restore deleted rows ---------------------------------------------------
+  // Undo of a delete: put the rows back into the file (and every other tab). Only
+  // reachable from the Deleted Records tab. Non-destructive, so it runs straight
+  // away without a confirm. `all` restores every row in the current filtered view.
+  async function restore(rowIndexes, all = false) {
+    const single = !all && rowIndexes.length === 1 ? rowIndexes[0] : null;
+    if (single !== null) markPending(single, true);
+    setBusy(true);
+    setError("");
+    try {
+      const qs = buildQs(true) + (all ? "&select_all=true" : "");
+      const d = await api(`/api/files/${file.id}/restore?${qs}`, {
+        method: "POST",
+        body: { rows: all ? [] : rowIndexes },
+      });
+      applyPayload(d);
+      clearSelection();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      if (single !== null) markPending(single, false);
+      setBusy(false);
+    }
+  }
+
   async function runBulk(action) {
     setBusy(true);
     setError("");
@@ -1272,6 +1299,13 @@ export default function ReviewStep({ file, onCommitted }) {
             >
               Manual Cleaned ({summary?.manual_clean ?? 0})
             </button>
+            <button
+              className={view === "deleted" ? "active" : ""}
+              onClick={() => switchView("deleted")}
+              title="Records you removed from the file — download them as Excel with the issue as the last column"
+            >
+              Deleted Records ({summary?.deleted ?? 0})
+            </button>
           </div>
           <button className="btn sm filter-btn" onClick={openFilters}>
             <Icon name="filter" size={14} />
@@ -1574,51 +1608,70 @@ export default function ReviewStep({ file, onCommitted }) {
                           onChange={() => toggleRow(row.row_index)}
                         />
                         <span className="rownum-n">{row.row_index + 1}</span>
-                        {pendingRows.has(row.row_index) ? (
-                          <span className="row-spin" title="Saving…" />
-                        ) : hasDraft ? (
-                          <button
-                            className="cell-save"
-                            title="Apply this row's edits"
-                            onClick={() => saveRow(row)}
-                          >
-                            <Icon name="check" size={12} />
-                          </button>
-                        ) : row.status === "error" ? (
-                          <button
-                            className="cell-keep"
-                            title="Keep this row as-is (mark reviewed)"
-                            onClick={() => keepRow(row.row_index)}
-                          >
-                            <Icon name="check" size={12} />
-                          </button>
-                        ) : view === "manual_clean" && row.manual_kind ? (
-                          <>
-                            {row.manual_kind === "kept" && (
-                              // Nothing on this row changed — the reviewer accepted it
-                              // as-is, so there's no cell to highlight. Mark the row.
-                              <span className="row-kept" title="Kept as-is by a reviewer — values unchanged">
-                                kept
-                              </span>
-                            )}
+                        {view === "deleted" ? (
+                          // Deleted Records tab: read-only snapshot with one action —
+                          // restore the row back into the file (and every other tab).
+                          pendingRows.has(row.row_index) ? (
+                            <span className="row-spin" title="Restoring…" />
+                          ) : (
                             <button
-                              className="cell-revert"
-                              title="Send this row back to Needs review (undoes the manual clean)"
-                              onClick={() => askRevert([row.row_index])}
+                              className="cell-restore"
+                              title="Restore this record back into the file"
+                              onClick={() => restore([row.row_index])}
+                              disabled={busy}
                             >
-                              <Icon name="arrowLeft" size={12} />
+                              <Icon name="restore" size={12} />
                             </button>
+                          )
+                        ) : (
+                          <>
+                            {pendingRows.has(row.row_index) ? (
+                              <span className="row-spin" title="Saving…" />
+                            ) : hasDraft ? (
+                              <button
+                                className="cell-save"
+                                title="Apply this row's edits"
+                                onClick={() => saveRow(row)}
+                              >
+                                <Icon name="check" size={12} />
+                              </button>
+                            ) : row.status === "error" ? (
+                              <button
+                                className="cell-keep"
+                                title="Keep this row as-is (mark reviewed)"
+                                onClick={() => keepRow(row.row_index)}
+                              >
+                                <Icon name="check" size={12} />
+                              </button>
+                            ) : view === "manual_clean" && row.manual_kind ? (
+                              <>
+                                {row.manual_kind === "kept" && (
+                                  // Nothing on this row changed — the reviewer accepted
+                                  // it as-is, so there's no cell to highlight. Mark it.
+                                  <span className="row-kept" title="Kept as-is by a reviewer — values unchanged">
+                                    kept
+                                  </span>
+                                )}
+                                <button
+                                  className="cell-revert"
+                                  title="Send this row back to Needs review (undoes the manual clean)"
+                                  onClick={() => askRevert([row.row_index])}
+                                >
+                                  <Icon name="arrowLeft" size={12} />
+                                </button>
+                              </>
+                            ) : null}
+                            {/* Delete this row — on any resting row in any tab. */}
+                            {!pendingRows.has(row.row_index) && !hasDraft && (
+                              <button
+                                className="cell-drop"
+                                title="Remove this row from the file (excluded from export and the master save)"
+                                onClick={() => askDrop([row.row_index])}
+                              >
+                                <Icon name="trash" size={12} />
+                              </button>
+                            )}
                           </>
-                        ) : null}
-                        {/* Delete this row — available on any resting row in any tab. */}
-                        {!pendingRows.has(row.row_index) && !hasDraft && (
-                          <button
-                            className="cell-drop"
-                            title="Remove this row from the file (excluded from export and the master save)"
-                            onClick={() => askDrop([row.row_index])}
-                          >
-                            <Icon name="trash" size={12} />
-                          </button>
                         )}
                       </td>
                       {displayColumns.map((c, ci) => {
@@ -1652,10 +1705,16 @@ export default function ReviewStep({ file, onCommitted }) {
                               style={{ "--tag": tagColor(issue.tag), ...pin }}
                               title={issue.message}
                             >
-                              <input
-                                value={val}
-                                onChange={(e) => setDraft(row.row_index, c, e.target.value)}
-                              />
+                              {view === "deleted" ? (
+                                // Deleted rows are a read-only snapshot — show the
+                                // flagged value as text, keeping the issue tag visible.
+                                <span className="flagged-val">{val || "—"}</span>
+                              ) : (
+                                <input
+                                  value={val}
+                                  onChange={(e) => setDraft(row.row_index, c, e.target.value)}
+                                />
+                              )}
                               <span className="cell-tag">
                                 {tagLabel[issue.tag] || issue.tag}
                                 {issue.related_rows?.length > 0 && (
@@ -1750,35 +1809,50 @@ export default function ReviewStep({ file, onCommitted }) {
             <button className="btn sm" onClick={clearSelection} disabled={busy}>
               Clear
             </button>
-            {view === "manual_clean" ? (
-              // These rows are already clean — offer to undo the manual clean and
-              // send them back to the review queue.
+            {view === "deleted" ? (
+              // Already-deleted rows: the only action is to restore them.
               <button
-                className="btn sm"
-                onClick={() => askRevert([...selected], selectAllPages)}
+                className="btn primary sm"
+                onClick={() => restore([...selected], selectAllPages)}
                 disabled={busy}
-                title="Undo the manual clean and put these rows back in Needs review"
+                title="Restore the selected records back into the file"
               >
-                <Icon name="arrowLeft" size={15} />
-                {busy ? "Reverting…" : "Send back to review"}
+                <Icon name="restore" size={15} />
+                {busy ? "Restoring…" : "Restore selected"}
               </button>
             ) : (
-              <button className="btn primary sm" onClick={keepSelected} disabled={busy}>
-                <Icon name="check" size={15} />
-                {busy ? "Keeping…" : "Keep selected as-is"}
-              </button>
+              <>
+                {view === "manual_clean" ? (
+                  // These rows are already clean — offer to undo the manual clean
+                  // and send them back to the review queue.
+                  <button
+                    className="btn sm"
+                    onClick={() => askRevert([...selected], selectAllPages)}
+                    disabled={busy}
+                    title="Undo the manual clean and put these rows back in Needs review"
+                  >
+                    <Icon name="arrowLeft" size={15} />
+                    {busy ? "Reverting…" : "Send back to review"}
+                  </button>
+                ) : (
+                  <button className="btn primary sm" onClick={keepSelected} disabled={busy}>
+                    <Icon name="check" size={15} />
+                    {busy ? "Keeping…" : "Keep selected as-is"}
+                  </button>
+                )}
+                {/* Delete works in every tab — remove the selected rows from the
+                    file entirely (they won't export or reach the master save). */}
+                <button
+                  className="btn danger sm"
+                  onClick={() => askDrop([...selected], selectAllPages)}
+                  disabled={busy}
+                  title="Remove the selected rows from the file (excluded from export and the master save)"
+                >
+                  <Icon name="trash" size={15} />
+                  {busy ? "Removing…" : `Remove selected`}
+                </button>
+              </>
             )}
-            {/* Delete works in every tab — remove the selected rows from the file
-                entirely (they won't export or reach the master save). */}
-            <button
-              className="btn danger sm"
-              onClick={() => askDrop([...selected], selectAllPages)}
-              disabled={busy}
-              title="Remove the selected rows from the file (excluded from export and the master save)"
-            >
-              <Icon name="trash" size={15} />
-              {busy ? "Removing…" : `Remove selected`}
-            </button>
           </div>
         </div>
       )}

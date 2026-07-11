@@ -2178,6 +2178,36 @@ input::placeholder {
   border-color: var(--red);
   color: var(--red);
 }
+/* "Restore row" per-row button (Deleted Records tab) — quiet outline, brand on
+   hover since it puts the removed row back into the file. */
+.cell-restore {
+  margin-left: 0.4rem;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 5px;
+  padding: 0.1rem 0.25rem;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.cell-restore:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.cell-restore:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* Read-only flagged value shown in the Deleted Records tab (no editable input). */
+.flagged-val {
+  display: block;
+  min-width: 150px;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.95rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Row selection */
 .row-check {

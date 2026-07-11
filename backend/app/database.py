@@ -29,7 +29,14 @@ def _int_env(name: str, default: int) -> int:
 # lifespan — which leaves the API "up" but wedged (permanent 502) long after the
 # database has recovered. A bounded timeout turns that into a fast, retryable
 # error instead. All values are env-overridable so they can be tuned per deploy.
-_CONNECT_TIMEOUT = _int_env("DB_CONNECT_TIMEOUT", 10)
+#
+# The default is generous (30s) because the remote Postgres this deploys against
+# has a slow, variable TCP-accept-to-handshake latency: it often connects in a few
+# seconds but intermittently needs >10s. A 10s cap made every startup retry (and
+# random live requests) time out even though the database was reachable, wedging
+# the API. 30s stays bounded (so a true outage still fails fast enough to retry)
+# while tolerating this database's slow handshake.
+_CONNECT_TIMEOUT = _int_env("DB_CONNECT_TIMEOUT", 30)
 
 # pool_pre_ping keeps Neon's serverless connections healthy across idle periods.
 # The pool is bounded so a burst of concurrent requests can't open unbounded

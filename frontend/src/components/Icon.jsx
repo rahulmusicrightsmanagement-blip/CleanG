@@ -155,6 +155,12 @@ const PATHS = {
       <line x1="6" y1="5" x2="6" y2="19" />
     </>
   ),
+  restore: (
+    <>
+      <polyline points="1 4 1 10 7 10" />
+      <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+    </>
+  ),
   trash: (
     <>
       <polyline points="3 6 5 6 21 6" />
