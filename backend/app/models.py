@@ -88,6 +88,14 @@ class MasterColumn(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     position: Mapped[int] = mapped_column(Integer, unique=True)
     name: Mapped[str] = mapped_column(String(255))
+    # True for columns a user added from an uploaded file (e.g. "Mood") that are
+    # not part of the seeded master format. Each is a REAL, dynamically-added
+    # column on `master_data`; `attr` holds its physical column name.
+    custom: Mapped[bool] = mapped_column(default=False)
+    # Physical `master_data` column name for a custom column (snake_case, `x_`
+    # prefixed — see core.dynamic_columns.make_attr). NULL for built-in columns,
+    # which use the static MASTER_COLUMN_TO_ATTR map below.
+    attr: Mapped[str | None] = mapped_column(String(63), nullable=True)
 
 
 class UploadedFile(Base):
@@ -124,6 +132,11 @@ class UploadedFile(Base):
     # rows where that column is empty (existing values are never overwritten), so
     # a whole-batch value (e.g. Revenue Share / Split) can be broadcast at once.
     constants: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Cells whose correction came from a value-merge (remap) rather than a hand
+    # edit, so the review grid can tag them "Merged value" separately from a typed
+    # correction. Same shape as `corrections`: {"<row_index>": {"<column>": true}}.
+    # A later hand edit or revert on the cell clears its mark.
+    merged_cells: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[FileStatus] = mapped_column(
         Enum(FileStatus, name="file_status"), default=FileStatus.uploaded
     )
@@ -237,6 +250,9 @@ class MasterData(Base):
     territory_restriction: Mapped[str] = mapped_column(String, default="")
     lead_artist: Mapped[str] = mapped_column(String, default="")
     agreement_no: Mapped[str] = mapped_column(String, default="")
+
+    # User-added custom columns are REAL columns on this table, added at runtime
+    # (see core.dynamic_columns) and attached to this mapper — not a JSON bag.
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

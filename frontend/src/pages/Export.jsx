@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, download } from "../api/client.js";
 import Icon from "../components/Icon.jsx";
+import Pager, { effectivePageSize } from "../components/Pager.jsx";
+
+// Mirrors schemas.PREVIEW_MAX_ROWS — the server rejects a bigger `limit`.
+const PREVIEW_MAX_ROWS = 2000;
 
 // One pre-filter row: type a name, pick from values that exist in the master
 // data, and the chosen values become chips. Suggestions are debounced.
@@ -104,6 +108,16 @@ export default function Export() {
   // values exist in the master data before presets/export unlock.
   const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState(null);
+
+  // Read-only preview of the (filtered) master data — just a view of the rows.
+  // The master dataset has no upper bound, so "All" is capped server-side
+  // (schemas.PREVIEW_MAX_ROWS); past that the pager simply keeps paging.
+  const [preview, setPreview] = useState({ columns: [], rows: [], total: 0 });
+  const [previewPage, setPreviewPage] = useState(0);
+  const [previewSize, setPreviewSize] = useState(50); // 0 = All
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewErr, setPreviewErr] = useState("");
+  const previewLimit = Math.min(effectivePageSize(previewSize), PREVIEW_MAX_ROWS);
 
   useEffect(() => {
     (async () => {
@@ -220,6 +234,58 @@ export default function Export() {
     }
   }
 
+  // Re-fetch the preview when the filters or the chosen columns change (debounced).
+  // Serialised into a key so array/object identity churn doesn't over-fire.
+  const previewKey = useMemo(
+    () => JSON.stringify({ f: filters, c: resolved }),
+    [filters, resolved]
+  );
+  // A filter/column change returns the preview to page 1.
+  useEffect(() => {
+    setPreviewPage(0);
+  }, [previewKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      setPreviewLoading(true);
+      setPreviewErr("");
+      try {
+        const cleanFilters = Object.fromEntries(
+          Object.entries(filters).filter(([, v]) => v.length)
+        );
+        const res = await api("/api/master/preview", {
+          method: "POST",
+          body: {
+            filters: cleanFilters,
+            columns: resolved,
+            limit: previewLimit,
+            offset: previewPage * previewLimit,
+          },
+        });
+        if (!cancelled) setPreview(res);
+      } catch (e) {
+        if (!cancelled) setPreviewErr(e.message);
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewKey, previewPage, previewLimit]);
+
+  const previewFrom = preview.total === 0 ? 0 : previewPage * previewLimit + 1;
+  const previewTo = Math.min((previewPage + 1) * previewLimit, preview.total);
+  const previewMaxPage = Math.max(0, Math.ceil(preview.total / previewLimit) - 1);
+
+  function changePreviewSize(n) {
+    setPreviewSize(n);
+    setPreviewPage(0); // page 1 is the only page guaranteed to survive the change
+  }
+
   const MODES = [
     { key: "PDL", title: "PDL + Custom", desc: "PDL preset columns, plus any extras you add." },
     { key: "SVF", title: "SVF + Custom", desc: "SVF preset columns, plus any extras you add." },
@@ -245,7 +311,10 @@ export default function Export() {
             column set), optionally narrow the rows, then download as Excel.
           </p>
         </div>
-        <span className="muted small">{options?.total_records ?? 0} records in master</span>
+        <div className="master-stat" title="Total cleaned records stored in the master dataset">
+          <span className="master-stat-num">{options?.total_records ?? 0}</span>
+          <span className="master-stat-label">rows in master data</span>
+        </div>
       </div>
 
       {error && (
@@ -322,6 +391,109 @@ export default function Export() {
         </div>
       )}
 
+      {/* Read-only preview of the (filtered) master data */}
+      <div className="card">
+        <div className="preview-head">
+          <h3 className="sec-title">
+            Preview <span className="muted small">· read-only view of the master data</span>
+          </h3>
+          <div className="preview-meta">
+            {previewLoading ? (
+              <span className="muted small">Loading…</span>
+            ) : (
+              <span className="muted small">
+                {preview.total > 0
+                  ? `Showing ${previewFrom}–${previewTo} of ${preview.total} row${
+                      preview.total === 1 ? "" : "s"
+                    }`
+                  : "No matching rows"}
+                {hasFilters ? " (filtered)" : ""}
+              </span>
+            )}
+            <button
+              className="btn download-preview-btn"
+              onClick={runExport}
+              disabled={busy || resolved.length === 0 || preview.total === 0}
+              title={
+                resolved.length === 0
+                  ? "Choose at least one column below"
+                  : "Download these rows as Excel"
+              }
+            >
+              <Icon name="download" size={15} />
+              {busy ? "Downloading…" : "Download Excel"}
+            </button>
+          </div>
+        </div>
+
+        {previewErr && (
+          <div className="alert"><Icon name="alert" size={16} /> {previewErr}</div>
+        )}
+
+        {/* Pager above the table as well as below it — the row count is already
+            spelled out in the header, so skip the redundant meta line here. */}
+        <Pager
+          page={previewPage}
+          pages={previewMaxPage + 1}
+          disabled={previewLoading}
+          onChange={setPreviewPage}
+          pageSize={previewSize}
+          onPageSizeChange={changePreviewSize}
+          maxPageSize={PREVIEW_MAX_ROWS}
+          meta={false}
+        />
+
+        <div className="preview-table-wrap">
+          <table className="table preview-table">
+            <thead>
+              <tr>
+                <th className="preview-idx">#</th>
+                {preview.columns.map((c) => (
+                  <th key={c}>{c}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {preview.rows.length === 0 ? (
+                <tr>
+                  <td
+                    className="muted"
+                    colSpan={preview.columns.length + 1}
+                    style={{ textAlign: "center", padding: "1.5rem" }}
+                  >
+                    {previewLoading ? "Loading…" : "No rows to show."}
+                  </td>
+                </tr>
+              ) : (
+                preview.rows.map((row, i) => (
+                  <tr key={i}>
+                    <td className="preview-idx">
+                      {previewPage * previewLimit + i + 1}
+                    </td>
+                    {preview.columns.map((c) => (
+                      <td key={c} title={row[c] || ""}>
+                        {row[c] || <span className="muted">—</span>}
+                      </td>
+                    ))}
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <Pager
+          page={previewPage}
+          pages={previewMaxPage + 1}
+          total={preview.total}
+          disabled={previewLoading}
+          onChange={setPreviewPage}
+          pageSize={previewSize}
+          onPageSizeChange={changePreviewSize}
+          maxPageSize={PREVIEW_MAX_ROWS}
+        />
+      </div>
+
       {/* 2 — Choose the export shape */}
       <div className={`card ${canProceed ? "" : "section-locked"}`}>
         <h3 className="sec-title">
@@ -387,7 +559,22 @@ export default function Export() {
         {mode === "CUSTOM" && (
           <div className="preset-config">
             <div className="preset-extra">
-              <span className="muted small">Pick the columns to export ({customCols.size} selected)</span>
+              <div className="checklist-head">
+                <span className="muted small">Pick the columns to export ({customCols.size} selected)</span>
+                <button
+                  type="button"
+                  className="link-btn small"
+                  onClick={() =>
+                    setCustomCols(
+                      customCols.size === allColumns.length
+                        ? new Set()
+                        : new Set(allColumns)
+                    )
+                  }
+                >
+                  {customCols.size === allColumns.length ? "Clear all" : "Select all"}
+                </button>
+              </div>
               <div className="col-checklist">
                 {allColumns.map((c) => {
                   const checked = customCols.has(c);
@@ -433,6 +620,7 @@ export default function Export() {
           {busy ? "Exporting…" : "Export to Excel"}
         </button>
       </div>
+
     </section>
   );
 }

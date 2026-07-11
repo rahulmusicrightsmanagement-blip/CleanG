@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import MASTER_COLUMN_TO_ATTR, MasterData
+from .dynamic_columns import master_column_attrs
 
 # Ownership/rights fields that may legitimately change while the recording stays
 # the same record — these are excluded from the identity hash and, when they
@@ -38,12 +39,26 @@ def fingerprint(values: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _row_attrs(values: dict) -> dict:
-    """Map a cleaned row (keyed by master column name) onto MasterData attrs."""
+def _row_attrs(values: dict, col_attr: dict[str, str]) -> dict:
+    """Map a cleaned row (keyed by master column name) onto MasterData attrs.
+
+    `col_attr` is the full built-in + custom name->attr map, so custom columns
+    are written to their real columns alongside the built-ins."""
     return {
         attr: (values.get(col) or "")
-        for col, attr in MASTER_COLUMN_TO_ATTR.items()
+        for col, attr in col_attr.items()
     }
+
+
+def _merge_custom(target: "MasterData", values: dict, custom: dict[str, str]) -> None:
+    """Fill blank custom columns on a stored record from a duplicate upload.
+
+    Never clobbers a non-blank stored value — a later file can only *add* a
+    custom-column value the record was missing, mirroring the old extras merge."""
+    for col, attr in custom.items():
+        val = (values.get(col) or "").strip()
+        if val and not (getattr(target, attr, "") or "").strip():
+            setattr(target, attr, val)
 
 
 def _ownership_differs(existing: MasterData, values: dict) -> bool:
@@ -91,6 +106,11 @@ def upsert_master_records(
     resolutions = resolutions or {}
     inserted = updated = duplicates = skipped_conflicts = 0
 
+    # Full built-in + custom name->attr map (attaches custom columns to the ORM),
+    # plus the custom-only subset used for the additive duplicate merge.
+    col_attr = master_column_attrs(db)
+    custom = {c: a for c, a in col_attr.items() if c not in MASTER_COLUMN_TO_ATTR}
+
     # Fingerprint every row once, then load all already-stored matches up front.
     fps = [fingerprint(r.values) for r in rows]
     unique_fps = list(dict.fromkeys(fps))
@@ -121,7 +141,7 @@ def upsert_master_records(
                 )
                 clash = existing.get(fp) or pending.get(fp)
                 if master is not None and (clash is None or clash is master):
-                    for attr, val in _row_attrs(values).items():
+                    for attr, val in _row_attrs(values, col_attr).items():
                         setattr(master, attr, val)
                     master.fingerprint = fp
                     master.branch_id = branch_id
@@ -142,18 +162,21 @@ def upsert_master_records(
                 branch_id=branch_id,
                 file_id=file_id,
                 fingerprint=fp,
-                **_row_attrs(values),
+                **_row_attrs(values, col_attr),
             )
             pending[fp] = obj
             inserted += 1
         elif _ownership_differs(target, values):
             # Same recording, new owner -> keep the latest values (and source refs).
-            for attr, val in _row_attrs(values).items():
+            for attr, val in _row_attrs(values, col_attr).items():
                 setattr(target, attr, val)
             target.branch_id = branch_id
             target.file_id = file_id
             updated += 1
         else:
+            # Identity + ownership already match. Still fold in any custom-column
+            # values this row carries that the stored record is missing.
+            _merge_custom(target, values, custom)
             duplicates += 1
 
     db.add_all(pending.values())  # one batched INSERT, committed by the caller
@@ -296,13 +319,22 @@ def find_conflicts(db: Session, rows: list) -> list[dict]:
     return conflicts
 
 
-def record_to_dict(rec: MasterData, columns: list[str] | None = None) -> dict:
+def record_to_dict(
+    rec: MasterData,
+    columns: list[str] | None = None,
+    col_attr: dict[str, str] | None = None,
+) -> dict:
     """A master row as {master column name: value}, optionally projected to
-    just `columns` — this is how any required field is extracted on demand."""
-    cols = columns or list(MASTER_COLUMN_TO_ATTR)
+    just `columns` — this is how any required field is extracted on demand.
+
+    `col_attr` is the name->attr map to resolve through; pass the full built-in +
+    custom map (see dynamic_columns.master_column_attrs) to include custom columns.
+    Defaults to the built-in schema only."""
+    col_attr = col_attr or MASTER_COLUMN_TO_ATTR
+    cols = columns or list(col_attr)
     out = {}
     for col in cols:
-        attr = MASTER_COLUMN_TO_ATTR.get(col)
+        attr = col_attr.get(col)
         if attr is not None:
             out[col] = getattr(rec, attr)
     return out
