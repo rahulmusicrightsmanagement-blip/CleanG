@@ -337,6 +337,7 @@ class CleanSummary(BaseModel):
     clean: int
     auto_clean: int = 0  # clean rows the tool fixed on its own
     manual_clean: int = 0  # clean rows a reviewer edited or kept as-is
+    deleted: int = 0  # rows a reviewer removed (the Deleted Records tab)
     errors: int
     auto_fixed: int  # number of cells auto-corrected
     tags: list[TagGroup]  # error types (needs review), grouped

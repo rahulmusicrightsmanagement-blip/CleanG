@@ -243,9 +243,8 @@ def _entry(f: UploadedFile) -> dict:
     accepted = set(f.accepted or [])
 
     rows: list[CleanRow] = []
+    deleted: list[CleanRow] = []
     for r in base:
-        if r.index in dropped:
-            continue
         override = corrections.get(str(r.index))
         if override:
             cleaned, issues = revalidate({**r.values, **override})
@@ -253,7 +252,13 @@ def _entry(f: UploadedFile) -> dict:
                 r.values, cleaned, issues, override, _merged_cols(f, r.index)
             )
             r = CleanRow(index=r.index, values=cleaned, issues=issues)
-        rows.append(r)
+        # Dropped rows are kept aside (out of the pipeline, exports and master
+        # save) but retained with their cleaned values + issues so the "Deleted
+        # Records" tab can show and download them.
+        if r.index in dropped:
+            deleted.append(r)
+        else:
+            rows.append(r)
 
     mark_duplicates(rows)
 
@@ -273,6 +278,7 @@ def _entry(f: UploadedFile) -> dict:
     entry = {
         "sig": sig,
         "rows": rows,
+        "deleted": deleted,
         "summary": None,
         "profile": None,
         "base_values": {r.index: r.values for r in base},
@@ -343,6 +349,15 @@ def _edit_in_place(f: UploadedFile, changed: set[int]) -> bool:
 def build_rows(f: UploadedFile) -> list[CleanRow]:
     """The cleaned, corrected, duplicate-checked rows for a file (cached)."""
     return _entry(f)["rows"]
+
+
+def build_deleted_rows(f: UploadedFile) -> list[CleanRow]:
+    """The rows a reviewer explicitly removed — powers the "Deleted Records" tab.
+
+    Excluded from `build_rows`, from exports and from the master save, but kept
+    here with their cleaned values and issues so they can be reviewed and
+    downloaded (with the issue as the last column)."""
+    return _entry(f)["deleted"]
 
 
 def _get_summary(f: UploadedFile) -> "CleanSummary":
@@ -441,7 +456,7 @@ def _review_payload(
     Optional `tags` (match ANY), `value_filters` (per-column value filters, AND'd
     across columns), `query` (tab-wide text search) and `sort`/`direction` are
     applied server-side so they hold across pages."""
-    rows = build_rows(f)
+    rows = build_deleted_rows(f) if view == "deleted" else build_rows(f)
     manual = _manual_kinds(f)
     filtered = _filter_rows(rows, view, tag, tags, value_filters, manual, query)
     filtered = _sort_rows(filtered, sort, direction)
@@ -481,6 +496,7 @@ def _summary(f: UploadedFile, rows: list[CleanRow]) -> CleanSummary:
         clean=clean,
         auto_clean=clean - manual_clean,
         manual_clean=manual_clean,
+        deleted=len(f.dropped or []),
         errors=len(rows) - clean,
         auto_fixed=auto_fixed,
         tags=[
@@ -1095,6 +1111,7 @@ _SHEET_NAMES = {
     "error": "Flagged rows",
     "auto_clean": "Auto cleaned",
     "manual_clean": "Manual cleaned",
+    "deleted": "Deleted records",
     "clean": "Clean rows",
     "all": "Rows",
 }
@@ -1211,8 +1228,9 @@ def export_rows(
     f = _get_file_or_404(file_id, user, db)
     manual = _manual_kinds(f)
     value_filters = _parse_value_filters(filters)
+    base = build_deleted_rows(f) if view == "deleted" else build_rows(f)
     rows = _filter_rows(
-        build_rows(f), view, tag, _split_csv(tags), value_filters, manual, q
+        base, view, tag, _split_csv(tags), value_filters, manual, q
     )
     rows = _sort_rows(rows, sort, dir)
     cols = _active_columns(f)
@@ -1521,6 +1539,60 @@ def drop_rows(
         db.commit()
         # Removing rows changes the row set (and cross-row duplicate flags), which
         # the in-place fast paths can't express — rebuild from the new signature.
+        _invalidate(file_id)
+
+    return _review_payload(
+        f, view, tag, page, page_size, include_profile,
+        tags=_split_csv(tags), sort=sort, direction=dir,
+        value_filters=_parse_value_filters(filters), query=q,
+    )
+
+
+@router.post("/api/files/{file_id}/restore", response_model=ReviewOut)
+def restore_rows(
+    file_id: int,
+    payload: RowsDrop,
+    view: str = "deleted",
+    tag: str | None = None,
+    tags: str | None = None,
+    sort: str | None = None,
+    dir: str = "asc",
+    filters: str | None = None,
+    q: str | None = None,
+    select_all: bool = False,
+    page: int = 0,
+    page_size: int = 50,
+    include_profile: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Put previously-deleted rows back into the file — undo of `drop`.
+
+    Restored rows re-enter every review tab, exports and the master save. The
+    reuse of `RowsDrop` is intentional: the payload shape (a list of row indices,
+    or `select_all=true`) is identical.
+
+    `select_all=true` restores every row in the current filtered Deleted Records
+    view (honoring the active tag/tags/value-filters/search) instead of `rows`."""
+    f = _get_file_or_404(file_id, user, db)
+    if select_all:
+        targets = {
+            r.index
+            for r in _filter_rows(
+                build_deleted_rows(f), view, tag, _split_csv(tags),
+                _parse_value_filters(filters), _manual_kinds(f), q,
+            )
+        }
+    else:
+        targets = set(payload.rows)
+
+    if targets & set(f.dropped or []):
+        dropped = set(f.dropped or [])
+        dropped.difference_update(targets)
+        f.dropped = sorted(dropped)
+        db.commit()
+        # Re-adding rows changes the row set (and cross-row duplicate flags) — the
+        # in-place fast paths can't express that, so rebuild from the new signature.
         _invalidate(file_id)
 
     return _review_payload(

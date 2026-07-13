@@ -10,6 +10,10 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       SECRET_KEY: ${SECRET_KEY}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # Seconds to wait for the Postgres handshake. Kept high because the remote
+      # DB's connect latency is slow and variable (intermittently >10s); a tight
+      # cap makes startup retries and live requests time out on a reachable DB.
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-30}
       # --- Bootstrap admin + token lifetime ---
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_NAME: ${ADMIN_NAME:-Administrator}
