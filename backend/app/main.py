@@ -6,8 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
 from .core.csrf import csrf_protect
@@ -161,45 +162,84 @@ def init_db() -> None:
         db.close()
 
 
-async def _init_db_with_retry() -> None:
-    """Run init_db(), retrying a transient database outage instead of wedging.
+class _DBState:
+    """Whether the database is currently usable, for the readiness gate below."""
 
-    A short database blip at boot used to hang the startup lifespan forever (no
-    connect timeout), leaving the API permanently returning 502 even after the
-    database recovered — a manual restart was the only way out. With a bounded
-    connect timeout, each attempt now fails fast; we retry with backoff so a brief
-    outage is ridden out in-process, and only a sustained outage lets the process
-    exit so the orchestrator (restart: unless-stopped) restarts it cleanly.
+    ready = False
+    error = ""
+
+
+db_state = _DBState()
+
+# Shown to the user (login page included) whenever the database is unreachable.
+DB_DOWN_DETAIL = (
+    "The database is temporarily unreachable, so we can't sign you in right now. "
+    "The service reconnects automatically — please retry in a minute."
+)
+
+
+def mark_db_down(exc: Exception) -> None:
+    """Flag the database as unusable so the supervisor re-initialises on recovery."""
+    db_state.ready = False
+    db_state.error = type(exc).__name__
+
+
+async def _db_supervisor() -> None:
+    """Keep trying to initialise the database, forever, in the background.
+
+    Startup must never *block* on the database. It used to: `init_db()` ran inside
+    the lifespan, so while the (remote, shared) Postgres was down the app never
+    finished starting — uvicorn sat at "Waiting for application startup", nginx and
+    Traefik had nothing to route to, and every request, including the login page's,
+    died as an opaque 502/503. Restarting the process could not fix that, because
+    the database, not the app, was the thing that was down.
+
+    So the app now starts immediately and this task owns the database: it retries
+    with backoff while the database is down, marks it ready once `init_db()`
+    succeeds, and picks the work back up if a later request finds the connection
+    dead (see `mark_db_down`). Meanwhile requests get a clear 503 instead of a 502,
+    and the moment the database comes back the app heals with no restart.
     """
     import asyncio
     import logging
 
-    from sqlalchemy.exc import DBAPIError, OperationalError
-
     log = logging.getLogger("uvicorn.error")
-    attempts = int(os.getenv("DB_INIT_ATTEMPTS", "8"))
-    for i in range(1, attempts + 1):
-        try:
-            await asyncio.to_thread(init_db)
-            return
-        except (OperationalError, DBAPIError) as exc:
-            if i == attempts:
-                log.error("Database unreachable after %d attempts; giving up so "
-                          "the orchestrator can restart the process.", attempts)
-                raise
-            delay = min(2.0 * 2 ** (i - 1), 20.0)
-            log.warning("init_db attempt %d/%d failed (%s); retrying in %.0fs",
-                        i, attempts, type(exc).__name__, delay)
-            await asyncio.sleep(delay)
+    max_delay = float(os.getenv("DB_RETRY_MAX_DELAY", "30"))
+    delay = 2.0
+    scheduler_started = False
+
+    while True:
+        if not db_state.ready:
+            try:
+                await asyncio.to_thread(init_db)
+                db_state.ready = True
+                db_state.error = ""
+                delay = 2.0
+                log.info("Database ready; API fully operational.")
+                if not scheduler_started:
+                    start_scheduler()  # daily report email (10:30 IST by default)
+                    scheduler_started = True
+            except Exception as exc:  # noqa: BLE001 — any failure must keep retrying
+                db_state.error = type(exc).__name__
+                log.warning(
+                    "Database unavailable (%s); serving 503 on data routes and "
+                    "retrying in %.0fs.", type(exc).__name__, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+                continue
+        await asyncio.sleep(5)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await _init_db_with_retry()
-    start_scheduler()  # daily report email (10:30 IST by default)
+    import asyncio
+
+    supervisor = asyncio.create_task(_db_supervisor())
     try:
         yield
     finally:
+        supervisor.cancel()
         shutdown_scheduler()
 
 
@@ -258,6 +298,36 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+# Paths that must answer even while the database is down: the health probe (the
+# container is alive and must keep receiving traffic so users get the message
+# below instead of the proxy's bare 502) and the static SPA served by nginx.
+_DB_FREE_PATHS = frozenset({"/api/health"})
+
+
+@app.middleware("http")
+async def require_database(request: Request, call_next):
+    """Answer data routes with a clear 503 while the database is unreachable."""
+    path = request.url.path
+    if path.startswith("/api/") and path not in _DB_FREE_PATHS and not db_state.ready:
+        return JSONResponse(
+            {"detail": DB_DOWN_DETAIL}, status_code=503, headers={"Retry-After": "30"}
+        )
+    return await call_next(request)
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error(request: Request, exc: SQLAlchemyError) -> Response:
+    """A database that dies *after* startup gets the same treatment as one that
+    was never up: flag it so the supervisor re-initialises on recovery, and tell
+    the caller what happened instead of leaking a 500."""
+    if isinstance(exc, (OperationalError, DBAPIError)):
+        mark_db_down(exc)
+        return JSONResponse(
+            {"detail": DB_DOWN_DETAIL}, status_code=503, headers={"Retry-After": "30"}
+        )
+    raise exc
+
+
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(branches.router)
@@ -270,4 +340,13 @@ app.include_router(reports.router)
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    """Liveness, not readiness. This stays 200 with the database down on purpose:
+    it reports the process is alive so the orchestrator keeps routing traffic here
+    (killing/restarting the container cannot fix a database that is down, and
+    pulling it out of the load balancer only replaces our explanatory 503 with the
+    proxy's bare 502). `database` carries the real state."""
+    return {
+        "status": "ok" if db_state.ready else "degraded",
+        "database": "up" if db_state.ready else "down",
+        "detail": "" if db_state.ready else db_state.error,
+    }

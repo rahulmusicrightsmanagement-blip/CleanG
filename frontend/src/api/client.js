@@ -20,6 +20,21 @@ export function csrfToken() {
   return readCookie(CSRF_COOKIE);
 }
 
+// The API answers an unreachable database with an explanatory 503. A 502/504 has
+// no JSON body at all — it comes from the proxy, not the app, and means the API
+// itself is down or restarting. Either way "Request failed (502)" tells the user
+// nothing they can act on, so gateway statuses get a plain-English message.
+const GATEWAY_MESSAGE = {
+  502: "The server is restarting. Please try again in a minute.",
+  503: "The service is temporarily unavailable. Please try again in a minute.",
+  504: "The server took too long to respond. Please try again.",
+};
+
+function errorMessage(status, data) {
+  if (data && data.detail) return data.detail;
+  return GATEWAY_MESSAGE[status] || `Request failed (${status})`;
+}
+
 function withCsrf(headers, method) {
   if (!SAFE_METHODS.has(method.toUpperCase())) {
     const token = readCookie(CSRF_COOKIE);
@@ -48,7 +63,7 @@ export async function api(path, { method = "GET", body } = {}) {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.detail || `Request failed (${res.status})`);
+    throw new Error(errorMessage(res.status, data));
   }
   return data;
 }
@@ -73,7 +88,7 @@ export async function download(
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || `Request failed (${res.status})`);
+    throw new Error(errorMessage(res.status, data));
   }
   const blob = await res.blob();
   const cd = res.headers.get("Content-Disposition") || "";
