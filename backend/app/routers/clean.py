@@ -2,6 +2,7 @@ import difflib
 import io
 import json
 from collections import Counter
+from collections.abc import Iterable
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -1122,7 +1123,11 @@ _FILL_ERROR = PatternFill("solid", fgColor="FFC7CE")   # red     -> unresolved e
 _HEADER_FONT = Font(bold=True)
 
 
-def _cell_review(r: "CleanRow", manual_kind: str | None = None) -> tuple[dict[str, str], dict[str, str], str]:
+def _cell_review(
+    r: "CleanRow",
+    manual_kind: str | None = None,
+    corrected_cols: "Iterable[str] | None" = None,
+) -> tuple[dict[str, str], dict[str, str], str]:
     """Per-cell review annotations for one row.
 
     Returns (edited, errored, issue_text):
@@ -1134,6 +1139,14 @@ def _cell_review(r: "CleanRow", manual_kind: str | None = None) -> tuple[dict[st
 
     `manual_kind` ("edited" / "kept") comes from the reviewer's actions, so a row
     kept as-is is called out even though none of its cells changed.
+
+    `corrected_cols` are the columns with a stored correction for this row. They
+    are needed because a correction only produces a "corrected" marker when the
+    value differs from what cleaning produced (see `_mark_corrected`) — so a
+    reviewer who types a value the cleaner would have produced anyway leaves a
+    row that counts as manually edited but carries no marker at all. Without
+    this, such a row exports with an empty Issue cell and no highlight, which
+    reads as "nothing happened here" when in fact a human set the value.
     """
     edited: dict[str, str] = {}
     errored: dict[str, str] = {}
@@ -1152,9 +1165,26 @@ def _cell_review(r: "CleanRow", manual_kind: str | None = None) -> tuple[dict[st
             edited[col] = f"'{old}' -> '{new}'"
             kind = "merged value" if i.get("tag") == "merged" else "manually corrected"
             notes.append(f"{col}: '{old}' -> '{new}' ({kind})")
+    for col in corrected_cols or ():
+        if col in edited or col in errored:
+            continue
+        value = r.values.get(col, "")
+        edited[col] = f"set to '{value}' by a reviewer"
+        notes.append(
+            f"{col}: set to '{value}' by a reviewer "
+            "(same as the cleaned value, so nothing changed)"
+        )
     if manual_kind == "kept" and not notes:
         notes.append("Kept as-is by a reviewer (values unchanged)")
     return edited, errored, "; ".join(notes)
+
+
+def _corrected_columns(f: UploadedFile) -> dict[int, list[str]]:
+    """row_index -> the columns a reviewer stored a correction for."""
+    return {
+        int(index): list(cells or {})
+        for index, cells in (f.corrections or {}).items()
+    }
 
 
 def _write_review_sheet(
@@ -1162,6 +1192,7 @@ def _write_review_sheet(
     rows: list["CleanRow"],
     cols: list[str],
     manual: dict[int, str] | None = None,
+    corrected: dict[int, list[str]] | None = None,
 ) -> None:
     """Second workbook sheet: the same rows as the export, but with every cell a
     human touched highlighted yellow and every unresolved error highlighted red,
@@ -1172,6 +1203,7 @@ def _write_review_sheet(
     cells are `WriteOnlyCell`s built inline (random-access `ws.cell()` is not
     available in write-only mode)."""
     manual = manual or {}
+    corrected = corrected or {}
     ws.freeze_panes = "A2"  # write-only: must be set before the first append
     header = []
     for value in ("Row", *cols, "Issue"):
@@ -1185,7 +1217,9 @@ def _write_review_sheet(
     )
     ws.append(header)
     for r in rows:
-        edited, errored, issue_text = _cell_review(r, manual.get(r.index))
+        edited, errored, issue_text = _cell_review(
+            r, manual.get(r.index), corrected.get(r.index)
+        )
         line = [r.index + 1]
         for col in cols:
             value = r.values.get(col, "")
@@ -1239,21 +1273,26 @@ def export_rows(
     # ~60s / ~130 MB (the default Workbook builds a styled object per cell, which
     # blew past the 60s proxy timeout — the reported "can't download") to ~3s / a
     # few MB, and scales to six-figure row counts well under any gateway timeout.
+    corrected = _corrected_columns(f)
+
     wb = Workbook(write_only=True)
     # Sheet 1 — the plain export we already ship.
     ws = wb.create_sheet(_SHEET_NAMES.get(view, "Rows"))
     ws.append(["Row", *cols, "Issues"])
     for r in rows:
-        issues = "; ".join(
-            f"{i['column']}: {i.get('message') or i.get('tag')}"
-            for i in r.issues
-            if i.get("action") == "error"
-        )
+        # The full review note, not just the unresolved errors. Listing only
+        # errors left this column empty on every tab whose rows are, by
+        # definition, error-free — most visibly "Manual cleaned", where a
+        # reviewer's own corrections are the entire point of the export and the
+        # column came out blank for every single row.
+        _, _, issues = _cell_review(r, manual.get(r.index), corrected.get(r.index))
         ws.append([r.index + 1, *[r.values.get(c, "") for c in cols], issues])
 
     # Sheet 2 — same rows, but human-edited cells highlighted (yellow) and
     # unresolved errors (red), with an Issue column, so the export can be reviewed.
-    _write_review_sheet(wb.create_sheet("Review (edits)"), rows, cols, manual)
+    _write_review_sheet(
+        wb.create_sheet("Review (edits)"), rows, cols, manual, corrected
+    )
 
     buf = io.BytesIO()
     wb.save(buf)

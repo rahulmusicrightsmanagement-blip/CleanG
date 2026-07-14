@@ -38,9 +38,27 @@ def _int_env(name: str, default: int) -> int:
 # while tolerating this database's slow handshake.
 _CONNECT_TIMEOUT = _int_env("DB_CONNECT_TIMEOUT", 30)
 
-# pool_pre_ping keeps Neon's serverless connections healthy across idle periods.
+_connect_args: dict[str, object] = {"connect_timeout": _CONNECT_TIMEOUT}
+
+# Server-side guard: auto-close a connection left idle inside a transaction (a
+# leaked session from a crashed worker) so it can't hold a slot forever and
+# exhaust the database's connection limit.
+#
+# It is sent as a libpq `options` startup parameter, which a connection POOLER
+# will not accept: PgBouncer (which is what Neon's `-pooler` endpoint runs)
+# rejects the connection outright with "unsupported startup parameter in
+# options". So it is only sent on a direct connection. Nothing is lost by
+# dropping it there — the pooler is itself what recycles idle connections.
+_is_pooled = "-pooler" in settings.database_url or "pgbouncer" in settings.database_url
+if not _is_pooled:
+    _connect_args["options"] = "-c idle_in_transaction_session_timeout=" + str(
+        _int_env("DB_IDLE_TX_TIMEOUT_MS", 60000)
+    )
+
+# pool_pre_ping keeps Neon's serverless connections healthy across idle periods
+# (it scales an idle branch to zero, so a pooled connection can be dead on reuse).
 # The pool is bounded so a burst of concurrent requests can't open unbounded
-# connections and exhaust the (shared) database's connection limit.
+# connections and exhaust the database's connection limit.
 engine = create_engine(
     _normalize_url(settings.database_url),
     pool_pre_ping=True,
@@ -48,14 +66,7 @@ engine = create_engine(
     pool_size=_int_env("DB_POOL_SIZE", 5),
     max_overflow=_int_env("DB_MAX_OVERFLOW", 10),
     pool_timeout=_int_env("DB_POOL_TIMEOUT", 30),
-    connect_args={
-        "connect_timeout": _CONNECT_TIMEOUT,
-        # Server-side guard: auto-close a connection left idle inside a
-        # transaction (a leaked session from a crashed worker) so it can't hold a
-        # slot forever and exhaust the database's connection limit.
-        "options": "-c idle_in_transaction_session_timeout="
-        + str(_int_env("DB_IDLE_TX_TIMEOUT_MS", 60000)),
-    },
+    connect_args=_connect_args,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
